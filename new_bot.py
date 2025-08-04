@@ -5,6 +5,7 @@ from datetime import datetime
 from flask import Flask, request
 from telegram import Bot, Update
 from telegram.ext import Dispatcher, CommandHandler
+from telegram.utils.request import Request
 from dotenv import load_dotenv
 from apscheduler.schedulers.background import BackgroundScheduler
 import pytz
@@ -24,6 +25,7 @@ from new_utils import (
     get_last_trades,
     simulate_and_store_full_history_with_progress,
     get_setup_strength,
+    get_live_data_status,
 )
 
 # Load environment
@@ -31,6 +33,8 @@ load_dotenv()
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 OWNER_CHAT_ID = os.getenv("OWNER_CHAT_ID")
+ASSET = os.getenv("TRADING_ASSET", "BTC").upper()
+PAIR_DISPLAY = f"{ASSET}/USDT"
 
 TP_POINTS = int(os.getenv("TP_POINTS", "600"))
 SL_POINTS = int(os.getenv("SL_POINTS", "200"))
@@ -39,17 +43,18 @@ WIN_PROB_THRESHOLD = float(os.getenv("WIN_PROB_THRESHOLD", "0.6"))
 # Timezone setup
 IST = pytz.timezone("Asia/Kolkata")
 
+
 def format_time_ist(dt=None):
     if dt is None:
         dt = datetime.utcnow()
-    # Assume dt is naive UTC
     return dt.replace(tzinfo=pytz.UTC).astimezone(IST).strftime("%Y-%m-%d %H:%M:%S %Z")
+
 
 # Logging
 logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
 logger = logging.getLogger("learner_bot")
 
-# Validate required env vars
+# Validate env
 if not TOKEN:
     raise SystemExit("Missing TELEGRAM_BOT_TOKEN in environment.")
 if not WEBHOOK_URL:
@@ -57,11 +62,14 @@ if not WEBHOOK_URL:
 if not OWNER_CHAT_ID:
     raise SystemExit("Missing OWNER_CHAT_ID in environment.")
 
-bot = Bot(token=TOKEN)
+# Telegram bot with higher connection pool to avoid pool-full warnings
+request_obj = Request(con_pool_size=20, connect_timeout=5, read_timeout=10)
+bot = Bot(token=TOKEN, request=request_obj)
+
 app = Flask(__name__)
 dispatcher = Dispatcher(bot, None, use_context=True)
 
-# Dedup / cooldown memory
+# Dedup / cooldown
 last_sent = {"long": (None, 0), "short": (None, 0)}
 COOLDOWN_SECONDS = 10 * 60  # 10 minutes
 PRICE_TOLERANCE = 0.01  # 1%
@@ -70,10 +78,34 @@ PRICE_TOLERANCE = 0.01  # 1%
 train_full_in_progress = False
 train_full_lock = threading.Lock()
 
+# Safe fetch fallback for live OHLCV
+_last_good_ohlcv = None
+_live_failures = 0
+LIVE_FAILURE_ALERT_THRESHOLD = 3
+
+def safe_fetch_ohlcv():
+    global _last_good_ohlcv, _live_failures
+    data = fetch_mexc_ohlcv()
+    if data:
+        _live_failures = 0
+        _last_good_ohlcv = data
+        return data
+    _live_failures += 1
+    if _live_failures >= LIVE_FAILURE_ALERT_THRESHOLD:
+        try:
+            bot.send_message(
+                chat_id=OWNER_CHAT_ID,
+                text=f"⚠️ Live OHLCV fetch failing {_live_failures} times in a row for {ASSET}. Using last good snapshot if available.",
+            )
+        except Exception:
+            pass
+    if _last_good_ohlcv:
+        return _last_good_ohlcv
+    return []
 
 def evaluate_signal():
     try:
-        ohlcv = fetch_mexc_ohlcv()
+        ohlcv = safe_fetch_ohlcv()
         if not ohlcv:
             logger.warning("No OHLCV data.")
             return None
@@ -165,9 +197,10 @@ def evaluate_signal():
         ci_display = f"{ci_lo:.2%}-{ci_hi:.2%}" if empirical is not None else "N/A"
 
         msg = (
-            f"🚨 {direction.upper()} Signal ({format_time_ist()})\n"
+            f"🚨 {direction.upper()} Signal for {ASSET} ({format_time_ist()})\n"
+            f"Pair: {PAIR_DISPLAY}\n"
             f"Entry: {entry_price:.1f}\n"
-            f"RSI: {rsi} | Wick%: {signal['wick_percent']}% | Liq: ${liquidation:,.0f} ({source})\n"
+            f"RSI: {rsi} | Wick%: {signal['wick_percent']}% | Liq proxy: ${liquidation:,.0f} ({source})\n"
             f"Base Score: {base_score} | WinProb: {signal['win_prob']} | Empirical: {emp_display} ({count} similar, CI {ci_display})\n"
             f"Composite Strength: {composite_strength} | RR: {signal['reward_to_risk']}\n"
             f"TP: +{signal['tp_pct']}% @ {signal['tp_price']:.1f} | SL: -{signal['sl_pct']}% @ {signal['sl_price']:.1f}"
@@ -178,16 +211,17 @@ def evaluate_signal():
         return None
 
 
-# Telegram command handlers
+# Command handlers
 def start(update, context):
     update.message.reply_text(
-        "Welcome to LearnerBot Ultimate!\nAvailable commands:\n"
+        f"Welcome to LearnerBot Ultimate (BTC edition)!\nAvailable commands:\n"
         "/menu - list\n"
         "/scan - current signal\n"
         "/train - incremental retrain\n"
         "/train_full - full-year backfill + learning\n"
         "/backtest - last 7 days simulation\n"
-        "/last30 - show last 30 stored trades"
+        "/last30 - show last 30 stored trades\n"
+        "/status - live data/status"
     )
 
 
@@ -292,6 +326,17 @@ def last30(update, context):
     update.message.reply_text(res)
 
 
+def status(update, context):
+    st = get_live_data_status()
+    text = (
+        f"🛰️ Live data status for {ASSET}:\n"
+        f"MEXC last success: {st['mexc_last_success']} [{'OK' if st['mexc_ok'] else 'STALE'}]\n"
+        f"Binance last success: {st['binance_last_success']} [{'OK' if st['binance_ok'] else 'STALE'}]\n"
+        f"Last used source: {st['last_used']}"
+    )
+    update.message.reply_text(text)
+
+
 # Register handlers
 dispatcher.add_handler(CommandHandler("start", start))
 dispatcher.add_handler(CommandHandler("menu", menu))
@@ -300,9 +345,9 @@ dispatcher.add_handler(CommandHandler("train", train))
 dispatcher.add_handler(CommandHandler("train_full", train_full))
 dispatcher.add_handler(CommandHandler("backtest", backtest))
 dispatcher.add_handler(CommandHandler("last30", last30))
+dispatcher.add_handler(CommandHandler("status", status))
 
-
-# Auto-scan scheduler with Indian timezone
+# Auto-scan scheduler in IST
 def auto_job():
     try:
         msg = evaluate_signal()
@@ -314,10 +359,35 @@ def auto_job():
 
 scheduler = BackgroundScheduler(timezone=IST)
 scheduler.add_job(auto_job, "interval", minutes=5, next_run_time=datetime.now(IST))
+
+# Health alert for MEXC staleness
+_mexc_alerted = False
+
+
+def health_check_job():
+    global _mexc_alerted
+    st = get_live_data_status()
+    if not st["mexc_ok"]:
+        if not _mexc_alerted:
+            bot.send_message(
+                chat_id=OWNER_CHAT_ID,
+                text=f"⚠️ MEXC live data stale. Last successful fetch: {st['mexc_last_success']}",
+            )
+            _mexc_alerted = True
+    else:
+        if _mexc_alerted:
+            bot.send_message(
+                chat_id=OWNER_CHAT_ID,
+                text="✅ MEXC live data recovered.",
+            )
+            _mexc_alerted = False
+
+
+scheduler.add_job(health_check_job, "interval", minutes=1)
 scheduler.start()
 
 
-# Webhook endpoints
+# Webhook
 @app.route(f"/{TOKEN}", methods=["POST"])
 def webhook():
     update = Update.de_json(request.get_json(force=True), bot)
@@ -330,6 +400,8 @@ def index():
     return "LearnerBot Ultimate running."
 
 if __name__ == "__main__":
-    logging.info("Starting LearnerBot Ultimate with webhook %s", f"{WEBHOOK_URL}/{TOKEN}")
+    logging.info(
+        "Starting LearnerBot Ultimate with webhook %s", f"{WEBHOOK_URL}/{TOKEN}"
+    )
     bot.set_webhook(url=f"{WEBHOOK_URL}/{TOKEN}")
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))

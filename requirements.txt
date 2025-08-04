@@ -7,6 +7,6 @@ scikit-learn
 joblib
 numpy
 scipy
+pytz
 six==1.16.0
 urllib3==1.26.18
-pytz
