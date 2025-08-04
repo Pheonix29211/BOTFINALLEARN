@@ -1,0 +1,9 @@
+python-telegram-bot==13.15
+Flask
+requests
+python-dotenv
+pandas
+scikit-learn
+joblib
+numpy
+scipy

@@ -1,0 +1,6 @@
+*.pyc
+__pycache__/
+.env
+trade_logs.db
+trade_model.pkl
+historical_ohlcv.pkl
