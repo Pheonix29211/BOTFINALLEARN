@@ -1,487 +1,539 @@
+# new_utils.py
 import os
 import time
 import sqlite3
-import logging
-from datetime import datetime
+import threading
 import joblib
-import numpy as np
-import pandas as pd
+import math
 import requests
+import numpy as np
+from datetime import datetime
+from sklearn.linear_model import SGDClassifier
+from sklearn.preprocessing import StandardScaler
 from scipy.stats import beta
 
-from sklearn.pipeline import make_pipeline
-from sklearn.preprocessing import StandardScaler
-from sklearn.linear_model import SGDClassifier
-
-# Configuration
-DB_FILE = "trade_logs.db"
-MODEL_FILE = "trade_model.pkl"
+# Constants / cache paths
+DB_PATH = "trade_logs.db"
+MODEL_PATH = "trade_model.pkl"
 HIST_CACHE = "historical_ohlcv.pkl"
-MEXC_BASE = "https://contract.mexc.com/api/v1/contract"
-SYMBOL = "BTC_USDT"
 
-# Logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("new_utils")
+# TP/SL hardcoded for simulation consistency; can be overridden externally if needed
+TP_POINTS = 600
+SL_POINTS = 200
 
-# In-memory EMA states for adaptive (still kept but not used for fixed TP/SL)
-VOL_EMA = None
-LIQ_EMA = None
+# Thread safety
+_db_lock = threading.Lock()
 
-# === Database helpers ===
+# Ensure database and schema
 def get_conn():
-    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-    c.execute(
-        """CREATE TABLE IF NOT EXISTS trades (
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    return conn
+
+def init_db():
+    with _db_lock:
+        conn = get_conn()
+        c = conn.cursor()
+        c.execute('''CREATE TABLE IF NOT EXISTS trades (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             time TEXT,
             direction TEXT,
             entry_price REAL,
-            result TEXT,
             exit_price REAL,
             exit_time TEXT,
+            result TEXT,
             rsi REAL,
             wick_percent REAL,
             liquidation_usd REAL,
             score REAL,
+            win_prob REAL,
             tp_pct REAL,
             sl_pct REAL,
-            win_prob REAL,
             reward_to_risk REAL,
             volume_z REAL,
             liq_ratio REAL,
-            news_sentiment REAL
-        )"""
-    )
-    conn.commit()
-    return conn
+            liquidation_source TEXT
+        )''')
+        conn.commit()
+        conn.close()
 
-def store_trade(trade):
+init_db()
+
+def store_trade(trade: dict):
+    """Thread-safe insert of a trade dict into DB."""
+    with _db_lock:
+        conn = get_conn()
+        c = conn.cursor()
+        c.execute(
+            '''INSERT INTO trades (
+                time,direction,entry_price,exit_price,exit_time,result,
+                rsi,wick_percent,liquidation_usd,score,win_prob,
+                tp_pct,sl_pct,reward_to_risk,volume_z,liq_ratio,liquidation_source
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+            (
+                trade.get("time"),
+                trade.get("direction"),
+                trade.get("entry_price"),
+                trade.get("exit_price"),
+                trade.get("exit_time"),
+                trade.get("result"),
+                trade.get("rsi"),
+                trade.get("wick_percent"),
+                trade.get("liquidation_usd"),
+                trade.get("score"),
+                trade.get("win_prob"),
+                trade.get("tp_pct"),
+                trade.get("sl_pct"),
+                trade.get("reward_to_risk"),
+                trade.get("volume_z"),
+                trade.get("liq_ratio"),
+                trade.get("liquidation_source"),
+            ),
+        )
+        conn.commit()
+        conn.close()
+
+def get_last_trades(n=10):
     conn = get_conn()
     c = conn.cursor()
-    c.execute(
-        """INSERT INTO trades (
-            time, direction, entry_price, result, exit_price, exit_time,
-            rsi, wick_percent, liquidation_usd, score, tp_pct, sl_pct,
-            win_prob, reward_to_risk, volume_z, liq_ratio, news_sentiment
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (
-            trade.get("time"),
-            trade.get("direction"),
-            trade.get("entry_price"),
-            trade.get("result", "open"),
-            trade.get("exit_price"),
-            trade.get("exit_time"),
-            trade.get("rsi"),
-            trade.get("wick_percent"),
-            trade.get("liquidation_usd"),
-            trade.get("score"),
-            trade.get("tp_pct"),
-            trade.get("sl_pct"),
-            trade.get("win_prob"),
-            trade.get("reward_to_risk"),
-            trade.get("volume_z"),
-            trade.get("liq_ratio"),
-            trade.get("news_sentiment"),
-        ),
-    )
-    conn.commit()
+    c.execute("SELECT time,direction,entry_price,exit_price,result,win_prob FROM trades ORDER BY id DESC LIMIT ?", (n,))
+    rows = c.fetchall()
     conn.close()
-
-def get_last_trades(n=30):
-    conn = get_conn()
-    df = pd.read_sql("SELECT * FROM trades ORDER BY id DESC LIMIT ?", conn, params=(n,))
-    conn.close()
-    if df.empty:
-        return "No trades yet."
+    if not rows:
+        return "No trades stored."
     lines = []
-    for _, r in df.iterrows():
-        lines.append(f'{r["time"]} | {r["direction"].upper()} @ {r["entry_price"]} | Result: {r["result"]} | Score: {r["score"]} | WinProb: {r["win_prob"]} | TP%: {r["tp_pct"]} | SL%: {r["sl_pct"]}')
-    return "\n".join(lines)
+    for t, direction, entry, exit_p, result, win_prob in rows:
+        lines.append(f"{t} | {direction.upper()} at {entry} | Exit: {exit_p} | {result} | WinProb: {win_prob}")
+    return "Last trades:\n" + "\n".join(lines)
 
-# === Historical data backfill ===
-def fetch_mexc_ohlcv(symbol=SYMBOL, interval="Min5", limit=100):
+# Feature computations
+def compute_rsi(prices, period=14):
+    prices = np.array(prices, dtype=float)
+    if len(prices) < period + 1:
+        return None
+    deltas = np.diff(prices)
+    ups = np.where(deltas > 0, deltas, 0)
+    downs = np.where(deltas < 0, -deltas, 0)
+    roll_up = np.convolve(ups, np.ones(period) / period, mode='valid')[-1]
+    roll_down = np.convolve(downs, np.ones(period) / period, mode='valid')[-1]
+    if roll_down == 0:
+        return 100.0
+    rs = roll_up / roll_down
+    rsi = 100 - (100 / (1 + rs))
+    return round(rsi, 2)
+
+def compute_atr(candles, period=14):
+    # candles: list of dicts with 'high','low','close','open'
+    if len(candles) < period + 1:
+        return None
+    trs = []
+    for i in range(1, len(candles)):
+        high = candles[i]["high"]
+        low = candles[i]["low"]
+        prev_close = candles[i - 1]["close"]
+        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+        trs.append(tr)
+    atr = np.mean(trs[-period:])
+    return round(atr, 4)
+
+# Data fetching
+def fetch_mexc_ohlcv(limit=50):
+    """
+    Fetch latest 5m OHLCV from MEXC. Fallback to Binance if failure.
+    MEXC contract endpoint example; adjust symbol as needed.
+    """
     try:
-        r = requests.get(f"{MEXC_BASE}/kline/{symbol}", params={"interval": interval, "limit": limit}, timeout=10)
-        r.raise_for_status()
-        resp = r.json()
-        if not resp.get("success", False):
-            logger.warning("OHLCV fetch failed: %s", resp)
-            return []
-        data = resp.get("data", {})
-        times = data.get("time", [])
-        opens = data.get("open", [])
-        highs = data.get("high", [])
-        lows = data.get("low", [])
-        closes = data.get("close", [])
-        volumes = data.get("volume", [])
+        # This endpoint pattern may vary; adjust symbol syntax if needed.
+        params = {
+            "symbol": "BTC_USDT",
+            "interval": "5m",
+            "limit": limit
+        }
+        resp = requests.get("https://contract.mexc.com/api/v1/contract/kline", params=params, timeout=10)
+        j = resp.json()
+        data = j.get("data") or []
         candles = []
-        for i in range(len(times)):
+        for entry in data:
+            # Format may be [timestamp, open, high, low, close, volume, ...]
+            ts = entry[0]
+            open_p = float(entry[1])
+            high = float(entry[2])
+            low = float(entry[3])
+            close_p = float(entry[4])
+            volume = float(entry[5])
             candles.append({
-                "open_time": times[i] * 1000,
-                "open": float(opens[i]),
-                "high": float(highs[i]),
-                "low": float(lows[i]),
-                "close": float(closes[i]),
-                "volume": float(volumes[i]) if i < len(volumes) else None,
+                "ts": ts,
+                "open": open_p,
+                "high": high,
+                "low": low,
+                "close": close_p,
+                "volume": volume
+            })
+        if candles:
+            return candles
+    except Exception:
+        pass
+
+    # Fallback to Binance
+    try:
+        resp = requests.get("https://api.binance.com/api/v3/klines",
+                            params={"symbol": "BTCUSDT", "interval": "5m", "limit": limit}, timeout=10)
+        data = resp.json()
+        candles = []
+        for entry in data:
+            open_p = float(entry[1])
+            high = float(entry[2])
+            low = float(entry[3])
+            close_p = float(entry[4])
+            volume = float(entry[5])
+            ts = entry[0]
+            candles.append({
+                "ts": ts,
+                "open": open_p,
+                "high": high,
+                "low": low,
+                "close": close_p,
+                "volume": volume
             })
         return candles
-    except Exception as e:
-        logger.warning("fetch_mexc_ohlcv error: %s", e)
+    except Exception:
         return []
 
-def fetch_mexc_ohlcv_range(symbol=SYMBOL, interval="Min5", start=None, end=None):
+def fetch_mexc_ohlcv_range(start, end, interval_minutes=5):
+    """Fetch historical range; will chunk if needed. start/end are epoch seconds."""
+    # MEXC might require milliseconds
     try:
-        params = {"interval": interval}
-        if start is not None:
-            params["start"] = int(start)
-        if end is not None:
-            params["end"] = int(end)
-        r = requests.get(f"{MEXC_BASE}/kline/{symbol}", params=params, timeout=10)
-        r.raise_for_status()
-        resp = r.json()
-        if not resp.get("success", False):
-            logger.warning("range fetch failed: %s", resp)
-            return []
-        data = resp.get("data", {})
-        times = data.get("time", [])
-        opens = data.get("open", [])
-        highs = data.get("high", [])
-        lows = data.get("low", [])
-        closes = data.get("close", [])
-        volumes = data.get("volume", [])
+        params = {
+            "symbol": "BTC_USDT",
+            "interval": f"{interval_minutes}m",
+            # some APIs expect startTime/endTime in ms
+            "startTime": int(start * 1000),
+            "endTime": int(end * 1000),
+            "limit": 1000
+        }
+        resp = requests.get("https://contract.mexc.com/api/v1/contract/kline", params=params, timeout=10)
+        j = resp.json()
+        data = j.get("data") or []
         candles = []
-        for i in range(len(times)):
+        for entry in data:
+            ts = entry[0]
+            open_p = float(entry[1])
+            high = float(entry[2])
+            low = float(entry[3])
+            close_p = float(entry[4])
+            volume = float(entry[5])
             candles.append({
-                "ts": times[i] * 1000,
-                "open": float(opens[i]),
-                "high": float(highs[i]),
-                "low": float(lows[i]),
-                "close": float(closes[i]),
-                "volume": float(volumes[i]) if i < len(volumes) else None,
+                "ts": ts,
+                "open": open_p,
+                "high": high,
+                "low": low,
+                "close": close_p,
+                "volume": volume
             })
         return candles
-    except Exception as e:
-        logger.warning("fetch range error: %s", e)
+    except Exception:
+        # fallback: empty
         return []
-
-def backfill_one_year():
-    now = int(time.time())
-    one_year_ago = now - 365 * 24 * 3600
-    all_candles = []
-    cursor = one_year_ago
-    chunk_seconds = 300 * 300
-    while cursor < now:
-        end = min(cursor + chunk_seconds, now)
-        chunk = fetch_mexc_ohlcv_range(start=cursor, end=end)
-        if chunk:
-            all_candles.extend(chunk)
-        time.sleep(0.2)
-        cursor = end
-    unique = {c["ts"]: c for c in all_candles if "ts" in c}
-    sorted_candles = sorted(unique.values(), key=lambda x: x["ts"])
-    joblib.dump(sorted_candles, HIST_CACHE)
-    return sorted_candles
 
 def load_cached_history():
     if os.path.exists(HIST_CACHE):
         try:
             return joblib.load(HIST_CACHE)
-        except Exception as e:
-            logger.warning("load cache error: %s", e)
-    return backfill_one_year()
+        except Exception:
+            pass
+    # On miss, backfill one year quickly (simple fallback)
+    now = int(time.time())
+    one_year_ago = now - 365 * 24 * 3600
+    bucket = fetch_mexc_ohlcv_range(start=one_year_ago, end=now)
+    if bucket:
+        joblib.dump(bucket, HIST_CACHE)
+        return bucket
+    return []
 
-# === Technical indicators ===
-def compute_rsi(closes, period=14):
-    if len(closes) < period + 1:
-        return None
-    deltas = np.diff(closes)
-    gains = np.where(deltas > 0, deltas, 0)
-    losses = np.where(deltas < 0, -deltas, 0)
-    avg_gain = np.mean(gains[:period])
-    avg_loss = np.mean(losses[:period])
-    if avg_loss == 0:
-        return 100.0
-    rs = avg_gain / avg_loss
-    rsi = 100 - (100 / (1 + rs))
-    return round(rsi, 2)
-
-def compute_atr(candles, period=14):
-    if len(candles) < period + 1:
-        return None
-    trs = []
-    for i in range(1, period + 1):
-        high = candles[i].get("high", 0)
-        low = candles[i].get("low", 0)
-        prev = candles[i - 1].get("close", 0)
-        tr = max(high - low, abs(high - prev), abs(low - prev))
-        trs.append(tr)
-    return sum(trs) / period
-
-# === Liquidation inference ===
 def infer_liquidation_pressure_from_mexc():
+    """Infer liquidation pressure from available MEXC contract ticker / open interest."""
     try:
-        r = requests.get(f"{MEXC_BASE}/ticker", params={"symbol": SYMBOL}, timeout=5)
-        r.raise_for_status()
-        data = r.json().get("data", {})
-        open_interest = float(data.get("holdVol", 0))
-        funding_rate = float(data.get("fundingRate", 0))
-        if open_interest <= 0:
-            return 0.0, "no_oi"
-        pressure = (open_interest / 1e9) * (1 + abs(funding_rate) * 10)
-        return pressure * 1_000_000, "mexc_inferred"
-    except Exception as e:
-        logger.warning("liquidation fetch error: %s", e)
-        return 0.0, "error"
-
-# === Scoring ===
-def score_long(rsi, lower_wick_pct, liquidation_usd, funding_rate=1.0):
-    score = 0.0
-    if rsi is not None and rsi < 35:
-        score += (35 - rsi) * 0.05
-    score += min(lower_wick_pct, 5) * 0.2
-    score += min(liquidation_usd / 5_000_000, 2) * 0.5
-    score *= funding_rate
-    return round(score, 2)
-
-def score_short(rsi, upper_wick_pct, liquidation_usd, funding_rate=1.0):
-    score = 0.0
-    if rsi is not None and rsi > 65:
-        score += (rsi - 65) * 0.03
-    score += min(upper_wick_pct, 5) * 0.2
-    score += min(liquidation_usd / 5_000_000, 2) * 0.5
-    score *= funding_rate
-    return round(score, 2)
-
-# === Learning model ===
-def _load_labeled_trades_df():
-    conn = get_conn()
-    df = pd.read_sql("SELECT * FROM trades WHERE result IN ('TP HIT','SL HIT')", conn)
-    conn.close()
-    if df.empty:
-        return None, None, None
-    df["label"] = df["result"].apply(lambda r: 1 if r == "TP HIT" else 0)
-    df["is_long"] = (df["direction"] == "long").astype(int)
-    df["liq_scaled"] = df["liquidation_usd"] / 1_000_000
-    X = df[["rsi", "wick_percent", "score", "liq_scaled", "is_long"]]
-    y = df["label"]
-    times = pd.to_datetime(df["time"])
-    return X, y, times
-
-def _compute_sample_weights(times, half_life_hours=72):
-    now = pd.Timestamp.utcnow()
-    hours = (now - times).dt.total_seconds() / 3600.0
-    return 0.5 ** (hours / half_life_hours)
-
-def train_model_incremental():
-    data = _load_labeled_trades_df()
-    if data is None:
-        return "Not enough labeled closed trades yet."
-    X, y, times = data
-    if len(y) < 30:
-        return f"Need at least 30 closed trades; have {len(y)}."
-    weights = _compute_sample_weights(times)
-    if os.path.exists(MODEL_FILE):
-        model = joblib.load(MODEL_FILE)
-    else:
-        model = make_pipeline(StandardScaler(), SGDClassifier(loss="log", max_iter=1000, tol=1e-3))
-    try:
-        model.named_steps["sgdclassifier"].partial_fit(X, y, classes=[0,1], sample_weight=weights)
+        resp = requests.get("https://contract.mexc.com/api/v1/contract/ticker", timeout=5)
+        j = resp.json()
+        data = j.get("data", {})
+        # Example inference: use turnover or open interest if available
+        liquidation = float(data.get("volume", 0))
+        return liquidation, "mexc_inferred"
     except Exception:
-        model.fit(X, y, sample_weight=weights)
-    joblib.dump(model, MODEL_FILE)
-    return f"Incrementally trained model on {len(y)} samples."
+        return 0.0, "fallback"
+
+# Simple scoring heuristics
+def score_long(rsi, lower_wick_pct, liquidation):
+    s = 0.0
+    if rsi is not None:
+        s += max(0, (50 - rsi) / 50)  # oversold component
+    s += min(lower_wick_pct / 100, 1.0)  # wick strength
+    s += min(liquidation / 1_000_000, 1.0)  # liquidity pressure bonus
+    return round(s, 2)
+
+def score_short(rsi, upper_wick_pct, liquidation):
+    s = 0.0
+    if rsi is not None:
+        s += max(0, (rsi - 50) / 50)  # overbought
+    s += min(upper_wick_pct / 100, 1.0)
+    s += min(liquidation / 1_000_000, 1.0)
+    return round(s, 2)
+
+# Model training & prediction
+def train_model_incremental():
+    """Re-train model from closed trades in DB."""
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT direction, rsi, wick_percent, liquidation_usd, result FROM trades WHERE result IS NOT NULL AND result != 'open'")
+    rows = c.fetchall()
+    conn.close()
+    if not rows:
+        return "No closed trades to train on."
+
+    X = []
+    y = []
+    for direction, rsi, wick, liq, result in rows:
+        features = [
+            rsi or 50,
+            wick or 0,
+            liq or 0,
+            1 if direction == "long" else 0,
+        ]
+        X.append(features)
+        # Simple label: TP HIT considered win, otherwise loss
+        label = 1 if "TP" in (result or "").upper() else 0
+        y.append(label)
+    X = np.array(X)
+    y = np.array(y)
+
+    scaler = StandardScaler()
+    Xs = scaler.fit_transform(X)
+
+    clf = SGDClassifier(loss="log_loss", max_iter=1000, tol=1e-3)
+    clf.fit(Xs, y)
+
+    # Save combined pipeline: scaler + classifier
+    joblib.dump({"scaler": scaler, "clf": clf}, MODEL_PATH)
+    return f"Trained on {len(y)} samples."
 
 def predict_win_prob(signal):
-    if not os.path.exists(MODEL_FILE):
-        return 1.0
+    if not os.path.exists(MODEL_PATH):
+        return 0.5  # no model yet
     try:
-        model = joblib.load(MODEL_FILE)
-        is_long = 1 if signal.get("direction") == "long" else 0
-        liq_scaled = signal.get("liquidation_usd", 0) / 1_000_000
-        feat = [
-            signal.get("rsi", 50),
-            signal.get("wick_percent", 0),
-            signal.get("score", 0),
-            liq_scaled,
-            is_long,
-        ]
-        X = pd.DataFrame([feat], columns=["rsi","wick_percent","score","liq_scaled","is_long"])
-        prob = model.predict_proba(X)[0][1]
-        return prob
-    except Exception as e:
-        logger.warning("predict error: %s", e)
-        return 1.0
+        obj = joblib.load(MODEL_PATH)
+        scaler = obj["scaler"]
+        clf = obj["clf"]
+        direction = signal.get("direction")
+        rsi = signal.get("rsi") or 50
+        wick = signal.get("wick_percent") or 0
+        liq = signal.get("liquidation_usd") or 0
+        features = np.array([[rsi, wick, liq, 1 if direction == "long" else 0]])
+        Xs = scaler.transform(features)
+        proba = clf.predict_proba(Xs)[0][1]
+        return round(float(proba), 2)
+    except Exception:
+        return 0.5
 
-# === Simulation / backtest ===
-def simulate_history(candles, lookahead_bars=12, tp_pct=0.015, sl_pct=0.01):
-    results = []
-    for i in range(15, len(candles) - lookahead_bars):
-        window = candles[i - 15 : i + 1]
-        closes = [c.get("close") for c in window]
-        rsi = compute_rsi(closes) if len(closes) >= 15 else None
-        last = window[-1]
-        open_p = last.get("open")
-        close_p = last.get("close")
-        high = last.get("high")
-        low = last.get("low")
-        total_range = high - low if high - low != 0 else 1
-        lower_wick = (min(open_p, close_p) - low) / total_range * 100
-        upper_wick = (high - max(open_p, close_p)) / total_range * 100
-        liquidation, source = infer_liquidation_pressure_from_mexc()
-        long_score = score_long(rsi, lower_wick, liquidation)
-        short_score = score_short(rsi, upper_wick, liquidation)
-        direction = None
-        wick_pct = 0
-        score = 0
-        if short_score > long_score and short_score >= 1.2:
-            direction = "short"
-            wick_pct = upper_wick
-            score = short_score
-        elif long_score >= short_score and long_score >= 1.2:
-            direction = "long"
-            wick_pct = lower_wick
-            score = long_score
-        else:
-            continue
-        entry_price = close_p
-        outcome = "SL HIT"
-        for future in candles[i+1:i+1+lookahead_bars]:
-            if direction == "long":
-                tp = entry_price * (1 + tp_pct)
-                sl = entry_price * (1 - sl_pct)
-                if future.get("high",0) >= tp:
-                    outcome = "TP HIT"
-                    break
-                if future.get("low",0) <= sl:
-                    outcome = "SL HIT"
-                    break
-            else:
-                tp = entry_price * (1 - tp_pct)
-                sl = entry_price * (1 + sl_pct)
-                if future.get("low",0) <= tp:
-                    outcome = "TP HIT"
-                    break
-                if future.get("high",0) >= sl:
-                    outcome = "SL HIT"
-                    break
-        label = 1 if outcome == "TP HIT" else 0
-        result = {
-            "time": datetime.utcfromtimestamp(candles[i].get("ts",0)/1000).strftime("%Y-%m-%d %H:%M:%S"),
+# Empirical strength: find k-nearest historical closed trades
+def fetch_closed_trades():
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT direction, rsi, wick_percent, liquidation_usd, result FROM trades WHERE result IS NOT NULL AND result != 'open'")
+    rows = c.fetchall()
+    conn.close()
+    trades = []
+    for direction, rsi, wick, liq, result in rows:
+        label = 1 if "TP" in (result or "").upper() else 0
+        trades.append({
             "direction": direction,
-            "entry_price": entry_price,
-            "rsi": rsi,
-            "wick_percent": round(wick_pct,2),
-            "liquidation_usd": liquidation,
-            "score": score,
-            "result": outcome,
-            "label": label,
-        }
-        results.append(result)
-    return results
+            "rsi": rsi or 50,
+            "wick_percent": wick or 0,
+            "liquidation_usd": liq or 0,
+            "label": label
+        })
+    return trades
 
-# === Similarity & strength estimation ===
-def _make_feature_vector(trade):
-    is_long = 1 if trade.get("direction") == "long" else 0
-    liq_scaled = (trade.get("liquidation_usd", 0) or 0) / 1_000_000
-    return np.array([
-        trade.get("rsi", 50),
-        trade.get("wick_percent", 0),
-        trade.get("score", 0),
-        liq_scaled,
-        is_long,
-        trade.get("reward_to_risk", 1.0),
+def get_setup_strength(signal, k=50):
+    """Returns empirical win rate and confidence interval from nearest neighbors."""
+    base_features = np.array([
+        signal.get("rsi") or 50,
+        signal.get("wick_percent") or 0,
+        signal.get("liquidation_usd") or 0,
+        1 if signal.get("direction") == "long" else 0,
     ], dtype=float)
 
-def get_similar_closed_trades(signal, k=50):
-    conn = get_conn()
-    df = pd.read_sql("SELECT * FROM trades WHERE result IN ('TP HIT','SL HIT')", conn)
-    conn.close()
-    if df.empty:
-        return []
-    past_vectors = []
-    records = []
-    for _, row in df.iterrows():
-        trade_dict = dict(row)
-        fv = _make_feature_vector(trade_dict)
-        past_vectors.append(fv)
-        records.append((trade_dict, fv, row["result"]))
-    X = np.vstack(past_vectors)
-    mu = X.mean(axis=0)
-    sigma = X.std(axis=0, ddof=1)
-    sigma[sigma == 0] = 1.0
-    X_norm = (X - mu) / sigma
-    qv = _make_feature_vector(signal)
-    qv_norm = (qv - mu) / sigma
-    dists = np.linalg.norm(X_norm - qv_norm, axis=1)
-    idxs = np.argsort(dists)[:k]
-    similar = []
-    for i in idxs:
-        trade_dict, fv, result = records[i]
-        similar.append({
-            "trade": trade_dict,
-            "result": result,
-            "distance": float(dists[i]),
-        })
-    return similar
+    trades = fetch_closed_trades()
+    if not trades:
+        return {"empirical_win_rate": None, "count": 0}
 
-def get_setup_strength(signal, k=50, prior_alpha=1, prior_beta=1):
-    similar = get_similar_closed_trades(signal, k=k)
-    if not similar:
-        return {
-            "empirical_win_rate": None,
-            "count": 0,
-            "ci_lower": None,
-            "ci_upper": None,
-        }
-    wins = sum(1 for s in similar if s["result"] == "TP HIT")
-    total = len(similar)
-    post_a = prior_alpha + wins
-    post_b = prior_beta + (total - wins)
-    empirical = post_a / (post_a + post_b)
-    ci_lower = beta.ppf(0.05, post_a, post_b)
-    ci_upper = beta.ppf(0.95, post_a, post_b)
+    # Compute Euclidean distance with feature scaling
+    X = []
+    labels = []
+    for t in trades:
+        f = np.array([t["rsi"], t["wick_percent"], t["liquidation_usd"], 1 if t["direction"] == "long" else 0], dtype=float)
+        X.append(f)
+        labels.append(t["label"])
+    X = np.array(X)
+    labels = np.array(labels)
+
+    # Simple normalization per feature (to avoid huge liquidation dominating)
+    # scale rsi [0,100], wick_percent [0,100], liquidation_usd (divide by 1e6), direction as binary
+    X_norm = np.column_stack([
+        X[:, 0] / 100.0,
+        X[:, 1] / 100.0,
+        X[:, 2] / 1_000_000.0,
+        X[:, 3]
+    ])
+    base_norm = np.array([
+        base_features[0] / 100.0,
+        base_features[1] / 100.0,
+        base_features[2] / 1_000_000.0,
+        base_features[3]
+    ])
+
+    dists = np.linalg.norm(X_norm - base_norm, axis=1)
+    idx = np.argsort(dists)[:k]
+    nearest_labels = labels[idx]
+    count = len(nearest_labels)
+    wins = int(nearest_labels.sum())
+
+    # Bayesian smoothing (Beta prior) to avoid 0/1 extremes
+    alpha = 1
+    beta_param = 1
+    empirical_rate = (wins + alpha) / (count + alpha + beta_param)
+    # Confidence interval (e.g., 90%)
+    ci_lower, ci_upper = beta.ppf([0.05, 0.95], wins + alpha, count - wins + beta_param)
     return {
-        "empirical_win_rate": empirical,
-        "count": total,
-        "ci_lower": ci_lower,
-        "ci_upper": ci_upper,
+        "empirical_win_rate": round(empirical_rate, 2),
+        "count": count,
+        "ci_lower": round(ci_lower, 2),
+        "ci_upper": round(ci_upper, 2),
     }
 
-# === Full-year simulation & training ===
-def simulate_and_store_full_history():
-    candles = load_cached_history()
+# Simulation over history
+def simulate_history(candles):
+    """Simulate signals over a list of candles with TP/SL logic."""
+    results = []
+    for i in range(15, len(candles) - 10):  # leave some lookahead
+        window = candles[i - 15 : i + 1]
+        closes = [c["close"] for c in window]
+        rsi = compute_rsi(closes) or 50
+        last = candles[i]
+        open_p = last["open"]
+        close_p = last["close"]
+        high = last["high"]
+        low = last["low"]
+        total_range = high - low if high - low != 0 else 1
+        lower_wick_pct = (min(open_p, close_p) - low) / total_range * 100
+        upper_wick_pct = (high - max(open_p, close_p)) / total_range * 100
+
+        liquidation, source = infer_liquidation_pressure_from_mexc()
+        long_score = score_long(rsi, lower_wick_pct, liquidation)
+        short_score = score_short(rsi, upper_wick_pct, liquidation)
+
+        direction = "long" if long_score >= short_score else "short"
+        entry_price = close_p
+        tp_price = entry_price + TP_POINTS if direction == "long" else entry_price - TP_POINTS
+        sl_price = entry_price - SL_POINTS if direction == "long" else entry_price + SL_POINTS
+
+        # Look ahead up to 20 candles for TP/SL
+        result_label = "NO SIGNAL"
+        exit_price = None
+        for future in candles[i+1 : i+21]:
+            if direction == "long":
+                if future["high"] >= tp_price:
+                    result_label = "TP HIT"
+                    exit_price = tp_price
+                    break
+                if future["low"] <= sl_price:
+                    result_label = "SL HIT"
+                    exit_price = sl_price
+                    break
+            else:
+                if future["low"] <= tp_price:
+                    result_label = "TP HIT"
+                    exit_price = tp_price
+                    break
+                if future["high"] >= sl_price:
+                    result_label = "SL HIT"
+                    exit_price = sl_price
+                    break
+        if result_label == "NO SIGNAL":
+            continue
+
+        trade = {
+            "time": datetime.utcfromtimestamp(last["ts"]/1000).strftime("%Y-%m-%d %H:%M:%S"),
+            "direction": direction,
+            "entry_price": entry_price,
+            "exit_price": round(exit_price, 2),
+            "exit_time": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+            "result": result_label,
+            "rsi": rsi,
+            "wick_percent": round(lower_wick_pct if direction == "long" else upper_wick_pct, 2),
+            "liquidation_usd": liquidation,
+            "score": long_score if direction == "long" else short_score,
+            "win_prob": 1.0,
+            "tp_pct": (TP_POINTS / entry_price) * 100,
+            "sl_pct": (SL_POINTS / entry_price) * 100,
+            "reward_to_risk": TP_POINTS / SL_POINTS,
+            "volume_z": 1.0,
+            "liq_ratio": 1.0,
+            "liquidation_source": source,
+        }
+        # Label for get_setup_strength uses label=1 for TP HIT
+        trade["label"] = 1 if result_label == "TP HIT" else 0
+        results.append(trade)
+    return results
+
+# Full-year backfill + simulation with progress
+def backfill_one_year_with_progress(progress_callback=None):
+    now = int(time.time())
+    one_year_ago = now - 365 * 24 * 3600
+    chunk_seconds = 300 * 300  # ~25h per chunk
+    total_chunks = ((now - one_year_ago) + chunk_seconds - 1) // chunk_seconds
+    all_candles = []
+    cursor = one_year_ago
+    chunk_index = 0
+    while cursor < now:
+        end = min(cursor + chunk_seconds, now)
+        chunk = fetch_mexc_ohlcv_range(start=cursor, end=end)
+        if chunk:
+            all_candles.extend(chunk)
+        cursor = end
+        chunk_index += 1
+        if progress_callback:
+            pct = int(chunk_index / total_chunks * 100)
+            progress_callback(f"🟦 Backfill progress: {pct}% ({chunk_index}/{total_chunks} chunks)")
+        time.sleep(0.2)
+    unique = {c["ts"]: c for c in all_candles if "ts" in c}
+    sorted_candles = sorted(unique.values(), key=lambda x: x["ts"])
+    joblib.dump(sorted_candles, HIST_CACHE)
+    if progress_callback:
+        progress_callback(f"✅ Backfill complete, cached {len(sorted_candles)} candles.")
+    return sorted_candles
+
+def simulate_and_store_full_history_with_progress(progress_callback=None):
+    if progress_callback:
+        progress_callback("🔁 Starting full-year backfill + simulation...")
+    candles = backfill_one_year_with_progress(progress_callback=progress_callback)
     if not candles:
         return "Failed to load historical candles."
+    if progress_callback:
+        progress_callback("🧠 Simulating signals over history...")
     results = simulate_history(candles)
     if not results:
         return "No signals simulated during full-year backfill."
     wins = sum(1 for r in results if r.get("label") == 1)
     total = len(results)
-    for r in results:
-        entry = r.get("entry_price")
-        direction = r.get("direction")
-        if r.get("result") == "TP HIT":
-            if direction == "long":
-                exit_price = entry * 1.015
-            else:
-                exit_price = entry * (1 - 0.015)
-        else:
-            if direction == "long":
-                exit_price = entry * (1 - 0.01)
-            else:
-                exit_price = entry * (1 + 0.01)
-        r["exit_price"] = round(exit_price,2)
-        r["exit_time"] = r.get("time")
-        r["tp_pct"] = 1.5
-        r["sl_pct"] = 1.0
-        r["win_prob"] = 1.0
-        r["reward_to_risk"] = 3.0
-        r["volume_z"] = 1.0
-        r["liq_ratio"] = 1.0
-        r["news_sentiment"] = 0.0
+    if progress_callback:
+        progress_callback(f"📊 Simulation complete: {wins}/{total} wins. Storing trades...")
+    for i, r in enumerate(results, start=1):
         store_trade(r)
+        if progress_callback and i % max(1, total // 10) == 0:
+            pct = int(i / total * 100)
+            progress_callback(f"💾 Storing trades: {pct}% ({i}/{total})")
+    if progress_callback:
+        progress_callback("📈 Training model on stored history...")
     train_msg = train_model_incremental()
+    if progress_callback:
+        progress_callback(f"✅ Training complete: {train_msg}")
     return f"Full-year simulation stored {total} trades, wins: {wins}/{total} ({wins/total:.1%}). {train_msg}"
