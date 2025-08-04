@@ -1,276 +1,282 @@
 import os
-import time
-import threading
-import joblib
-import math
-import logging
+import json
 import requests
-import numpy as np
-from datetime import datetime
-from sklearn.linear_model import SGDClassifier
-from sklearn.preprocessing import StandardScaler
-from scipy.stats import beta
+import sqlite3
+import logging
+import time
+from datetime import datetime, timedelta
+import pytz
 
-# Logging
-logger = logging.getLogger("learner_bot")
+# --- Configuration / files ---
+DB_FILE = "trade_logs.db"
+STRATEGY_FILE = "strategy.json"
+PERF_FILE = "performance_stats.json"
 
-# Constants / paths
-DB_PATH = "trade_logs.db"
-MODEL_PATH = "trade_model.pkl"
-HIST_CACHE = "historical_ohlcv.pkl"
+# --- API keys ---
+COINGLASS_API_KEY = os.getenv("COINGLASS_API_KEY", "").strip()
+NEWS_API_KEY = os.getenv("NEWS_API_KEY", "").strip()
 
-# Default TP/SL used in backtest logic if not overridden
-TP_POINTS = 600
-SL_POINTS = 200
+# --- Logging ---
+logger = logging.getLogger("liquidbot_utils")
+logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 
-# Thread-safety
-_db_lock = threading.Lock()
+# --- Live data tracking ---
+_LAST_MEXC_OHLCV_SUCCESS = None
+_LAST_MEXC_TICKER_SUCCESS = None
+_LAST_COINGLASS_SUCCESS = None
+_LAST_LIQ_SOURCE = "none"
+_LAST_MEXC_OI = None  # for delta in enhanced inference
 
-# Live source tracking
-_LAST_MEXC_SUCCESS = None
-_LAST_BINANCE_SUCCESS = None
-_LAST_LIVE_SOURCE = None
+# --- Timezones ---
+UTC = pytz.UTC
+IST = pytz.timezone("Asia/Kolkata")
 
-# Open interest memory
-_LAST_MEXC_OI = None
-
-
-# Database initialization
-def get_conn():
-    return sqlite3_connection()
-
-def sqlite3_connection():
-    return __import__("sqlite3").connect(DB_PATH, check_same_thread=False)
-
-
-def init_db():
-    with _db_lock:
-        conn = get_conn()
-        c = conn.cursor()
-        c.execute(
-            """CREATE TABLE IF NOT EXISTS trades (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                time TEXT,
-                direction TEXT,
-                entry_price REAL,
-                exit_price REAL,
-                exit_time TEXT,
-                result TEXT,
-                rsi REAL,
-                wick_percent REAL,
-                liquidation_usd REAL,
-                score REAL,
-                win_prob REAL,
-                tp_pct REAL,
-                sl_pct REAL,
-                reward_to_risk REAL,
-                volume_z REAL,
-                liq_ratio REAL,
-                liquidation_source TEXT
-            )"""
-        )
-        conn.commit()
-        conn.close()
-
-
-init_db()
-
-
-def store_trade(trade: dict):
-    with _db_lock:
-        conn = get_conn()
-        c = conn.cursor()
-        c.execute(
-            """INSERT INTO trades (
-                time,direction,entry_price,exit_price,exit_time,result,
-                rsi,wick_percent,liquidation_usd,score,win_prob,
-                tp_pct,sl_pct,reward_to_risk,volume_z,liq_ratio,liquidation_source
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (
-                trade.get("time"),
-                trade.get("direction"),
-                trade.get("entry_price"),
-                trade.get("exit_price"),
-                trade.get("exit_time"),
-                trade.get("result"),
-                trade.get("rsi"),
-                trade.get("wick_percent"),
-                trade.get("liquidation_usd"),
-                trade.get("score"),
-                trade.get("win_prob"),
-                trade.get("tp_pct"),
-                trade.get("sl_pct"),
-                trade.get("reward_to_risk"),
-                trade.get("volume_z"),
-                trade.get("liq_ratio"),
-                trade.get("liquidation_source"),
-            ),
-        )
-        conn.commit()
-        conn.close()
-
-
-def get_last_trades(n=10):
-    conn = get_conn()
+# --- DB helpers ---
+def _get_conn():
+    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
     c = conn.cursor()
     c.execute(
-        "SELECT time,direction,entry_price,exit_price,result,win_prob FROM trades ORDER BY id DESC LIMIT ?",
-        (n,),
+        """CREATE TABLE IF NOT EXISTS trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            time TEXT,
+            direction TEXT,
+            entry_price REAL,
+            result TEXT,
+            exit_price REAL,
+            exit_time TEXT,
+            rsi REAL,
+            wick_percent REAL,
+            liquidation_usd REAL,
+            score REAL,
+            tp_points INTEGER,
+            sl_points INTEGER,
+            liquidation_source TEXT,
+            win_prob REAL,
+            session TEXT
+        )"""
     )
+    conn.commit()
+    return conn
+
+# --- Performance tracking ---
+def _init_perf():
+    default = {
+        "score_buckets": {
+            "low": {"wins": 0, "losses": 0, "total": 0},
+            "mid": {"wins": 0, "losses": 0, "total": 0},
+            "high": {"wins": 0, "losses": 0, "total": 0},
+        },
+        "sessions": {
+            "Asia": {"wins": 0, "losses": 0, "total": 0},
+            "USA": {"wins": 0, "losses": 0, "total": 0},
+            "other": {"wins": 0, "losses": 0, "total": 0},
+        },
+        "last_updated": None,
+    }
+    return default
+
+def load_performance():
+    if not os.path.exists(PERF_FILE):
+        perf = _init_perf()
+        save_performance(perf)
+        return perf
+    try:
+        with open(PERF_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        perf = _init_perf()
+        save_performance(perf)
+        return perf
+
+def save_performance(perf):
+    perf["last_updated"] = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    with open(PERF_FILE, "w") as f:
+        json.dump(perf, f, indent=2)
+
+def bucket_for_score(score):
+    if score >= 1.5:
+        return "high"
+    elif score >= 1.0:
+        return "mid"
+    else:
+        return "low"
+
+def session_for_time(utc_dt):
+    # Convert to IST to decide session
+    ist_dt = utc_dt.astimezone(IST)
+    hour = ist_dt.hour
+    # Define Asia session early part, USA evening in IST
+    if 0 <= hour < 12:
+        return "Asia"
+    elif 16 <= hour <= 23:
+        return "USA"
+    else:
+        return "other"
+
+def update_performance_from_closed_trades(days=180):
+    perf = _init_perf()
+    cutoff = datetime.utcnow() - timedelta(days=days)
+    conn = _get_conn()
+    c = conn.cursor()
+    c.execute("SELECT * FROM trades WHERE result IN ('TP HIT','SL HIT')")
     rows = c.fetchall()
     conn.close()
-    if not rows:
-        return "No trades stored."
+    for r in rows:
+        # r schema: id, time, direction, entry_price, result, exit_price, exit_time, rsi, wick, liq, score, tp_points, sl_points, source, win_prob, session
+        time_str = r[1]
+        score = r[10]
+        result = r[4]
+        session = r[15] if len(r) > 15 else "other"
+        try:
+            trade_dt = datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S")
+            trade_dt = UTC.localize(trade_dt)
+        except Exception:
+            trade_dt = datetime.utcnow()
+        if trade_dt < cutoff:
+            continue
+        bucket = bucket_for_score(score)
+        # Update bucket
+        if result == "TP HIT":
+            perf["score_buckets"][bucket]["wins"] += 1
+        elif result == "SL HIT":
+            perf["score_buckets"][bucket]["losses"] += 1
+        perf["score_buckets"][bucket]["total"] += 1
+        # Update session
+        sess = session if session in perf["sessions"] else session_for_time(trade_dt)
+        if result == "TP HIT":
+            perf["sessions"][sess]["wins"] += 1
+        elif result == "SL HIT":
+            perf["sessions"][sess]["losses"] += 1
+        perf["sessions"][sess]["total"] += 1
+    save_performance(perf)
+    return perf
+
+def record_closed_trade_in_perf(trade):
+    perf = load_performance()
+    bucket = bucket_for_score(trade["score"])
+    session = trade.get("session", "other")
+    # bucket
+    if trade["result"] == "TP HIT":
+        perf["score_buckets"][bucket]["wins"] += 1
+    elif trade["result"] == "SL HIT":
+        perf["score_buckets"][bucket]["losses"] += 1
+    perf["score_buckets"][bucket]["total"] += 1
+    # session
+    if session not in perf["sessions"]:
+        session = session_for_time(UTC.localize(datetime.utcnow()))
+    if trade["result"] == "TP HIT":
+        perf["sessions"][session]["wins"] += 1
+    elif trade["result"] == "SL HIT":
+        perf["sessions"][session]["losses"] += 1
+    perf["sessions"][session]["total"] += 1
+    save_performance(perf)
+
+def get_bucket_win_rate(bucket_name):
+    perf = load_performance()
+    bucket = perf["score_buckets"].get(bucket_name, {"wins": 0, "losses": 0, "total": 0})
+    # Laplace smoothing
+    wins = bucket["wins"] + 1
+    total = bucket["total"] + 2
+    return wins / total
+
+def get_session_win_rate(session_name):
+    perf = load_performance()
+    sess = perf["sessions"].get(session_name, {"wins": 0, "losses": 0, "total": 0})
+    wins = sess["wins"] + 1
+    total = sess["total"] + 2
+    return wins / total
+
+def format_performance():
+    perf = load_performance()
     lines = []
-    for t, direction, entry, exit_p, result, win_prob in rows:
-        lines.append(f"{t} | {direction.upper()} at {entry} | Exit: {exit_p} | {result} | WinProb: {win_prob}")
-    return "Last trades:\n" + "\n".join(lines)
+    lines.append("=== Score Bucket Performance (Laplace-smoothed) ===")
+    for name in ["high", "mid", "low"]:
+        b = perf["score_buckets"][name]
+        win_rate = get_bucket_win_rate(name)
+        lines.append(f"{name.title():5}: wins={b['wins']} losses={b['losses']} total={b['total']} win_rate={win_rate:.2%}")
+    lines.append("\n=== Session Performance ===")
+    for sess in ["Asia", "USA", "other"]:
+        s = perf["sessions"][sess]
+        win_rate = get_session_win_rate(sess)
+        lines.append(f"{sess:5}: wins={s['wins']} losses={s['losses']} total={s['total']} win_rate={win_rate:.2%}")
+    return "\n".join(lines)
 
+# --- MEXC / market data ---
+MEXC_BASE = "https://contract.mexc.com/api/v1/contract"
+SYMBOL = os.getenv("MEXC_SYMBOL", "BTC_USDT")  # default
 
-# RSI and ATR
-def compute_rsi(prices, period=14):
-    prices = np.array(prices, dtype=float)
-    if len(prices) < period + 1:
-        return None
-    deltas = np.diff(prices)
-    ups = np.where(deltas > 0, deltas, 0)
-    downs = np.where(deltas < 0, -deltas, 0)
-    roll_up = np.convolve(ups, np.ones(period) / period, mode="valid")[-1]
-    roll_down = np.convolve(downs, np.ones(period) / period, mode="valid")[-1]
-    if roll_down == 0:
-        return 100.0
-    rs = roll_up / roll_down
-    rsi = 100 - (100 / (1 + rs))
-    return round(rsi, 2)
-
-
-def compute_atr(candles, period=14):
-    if len(candles) < period + 1:
-        return None
-    trs = []
-    for i in range(1, len(candles)):
-        high = candles[i]["high"]
-        low = candles[i]["low"]
-        prev_close = candles[i - 1]["close"]
-        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
-        trs.append(tr)
-    atr = np.mean(trs[-period:])
-    return round(atr, 4)
-
-
-# MEXC + Binance OHLCV fetching with live status tracking
-def fetch_mexc_ohlcv_primary(limit=50):
-    global _LAST_MEXC_SUCCESS, _LAST_LIVE_SOURCE
-    try:
-        symbol = os.getenv("MEXC_SYMBOL", "BTC_USDT")
-        params = {"symbol": symbol, "interval": "5m", "limit": limit}
-        resp = requests.get("https://contract.mexc.com/api/v1/contract/kline", params=params, timeout=10)
-        if resp.status_code != 200:
-            raise Exception(f"Status {resp.status_code}")
-        j = resp.json()
-        raw = j.get("data")
-        if not isinstance(raw, list) or not raw:
-            raise Exception("Missing data")
-        candles = []
-        for entry in raw:
-            ts = entry[0]
-            open_p = float(entry[1])
-            high = float(entry[2])
-            low = float(entry[3])
-            close_p = float(entry[4])
-            volume = float(entry[5])
-            candles.append(
-                {"ts": ts, "open": open_p, "high": high, "low": low, "close": close_p, "volume": volume}
-            )
-        _LAST_MEXC_SUCCESS = time.time()
-        _LAST_LIVE_SOURCE = "mexc"
-        return candles
-    except Exception as e:
-        logger.warning("MEXC primary fetch failed: %s", e)
-        return []
-
-
-def fetch_binance_ohlcv(limit=50):
-    global _LAST_BINANCE_SUCCESS, _LAST_LIVE_SOURCE
-    try:
-        symbol = os.getenv("BINANCE_SYMBOL", "BTCUSDT")
-        resp = requests.get(
-            "https://api.binance.com/api/v3/klines", params={"symbol": symbol, "interval": "5m", "limit": limit}, timeout=10
-        )
-        if resp.status_code != 200:
-            raise Exception(f"Status {resp.status_code}")
-        data = resp.json()
-        if not isinstance(data, list) or not data:
-            raise Exception("Malformed data")
-        candles = []
-        for entry in data:
-            ts = entry[0]
-            open_p = float(entry[1])
-            high = float(entry[2])
-            low = float(entry[3])
-            close_p = float(entry[4])
-            volume = float(entry[5])
-            candles.append(
-                {"ts": ts, "open": open_p, "high": high, "low": low, "close": close_p, "volume": volume}
-            )
-        _LAST_BINANCE_SUCCESS = time.time()
-        _LAST_LIVE_SOURCE = "binance"
-        return candles
-    except Exception as e:
-        logger.warning("Binance fetch failed: %s", e)
-        return []
-
-
-def fetch_mexc_ohlcv(limit=50):
-    candles = fetch_mexc_ohlcv_primary(limit=limit)
-    if candles:
-        return candles
-    return fetch_binance_ohlcv(limit=limit)
-
-
-def get_live_data_status():
-    now = time.time()
-
-    def fmt(ts):
-        if not ts:
-            return "never"
-        return datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S UTC")
-
-    mexc_ok = False
-    binance_ok = False
-    if _LAST_MEXC_SUCCESS:
-        mexc_ok = (now - _LAST_MEXC_SUCCESS) < 300
-    if _LAST_BINANCE_SUCCESS:
-        binance_ok = (now - _LAST_BINANCE_SUCCESS) < 300
-
-    return {
-        "mexc_last_success": fmt(_LAST_MEXC_SUCCESS),
-        "binance_last_success": fmt(_LAST_BINANCE_SUCCESS),
-        "last_used": _LAST_LIVE_SOURCE or "none",
-        "mexc_ok": mexc_ok,
-        "binance_ok": binance_ok,
+def fetch_mexc_ohlcv(symbol=SYMBOL, interval="Min5", limit=50):
+    global _LAST_MEXC_OHLCV_SUCCESS
+    interval_map = {
+        "Min1": 60,
+        "Min5": 300,
+        "Min15": 900,
+        "Min30": 1800,
+        "Min60": 3600,
+        "Hour4": 4 * 3600,
+        "Hour8": 8 * 3600,
+        "Day1": 24 * 3600,
     }
-
-
-# Enhanced liquidation proxy from MEXC: volume, open interest delta, funding rate
-def infer_liquidation_pressure_from_mexc():
-    global _LAST_MEXC_OI
+    step = interval_map.get(interval, 300)
+    end = int(time.time())
+    start = end - step * limit
+    params = {"interval": interval, "start": start, "end": end}
     try:
-        symbol = os.getenv("MEXC_SYMBOL", "BTC_USDT")
-        resp = requests.get("https://contract.mexc.com/api/v1/contract/ticker", timeout=5)
-        j = resp.json()
-        data = j.get("data", {})
+        url = f"{MEXC_BASE}/kline/{symbol}"
+        r = requests.get(url, params=params, timeout=8, headers={"User-Agent": "LiquidBot/1.0"})
+        r.raise_for_status()
+        resp = r.json()
+        if not resp.get("success"):
+            logging.warning("MEXC kline returned not success: %s", resp)
+            return []
+        data = resp.get("data", {})
+        times = data.get("time", [])
+        opens = data.get("open", [])
+        highs = data.get("high", [])
+        lows = data.get("low", [])
+        closes = data.get("close", [])
+        candles = []
+        for i in range(len(times)):
+            candles.append(
+                {
+                    "open_time": times[i] * 1000,
+                    "open": float(opens[i]),
+                    "high": float(highs[i]),
+                    "low": float(lows[i]),
+                    "close": float(closes[i]),
+                }
+            )
+        _LAST_MEXC_OHLCV_SUCCESS = time.time()
+        return candles
+    except Exception as e:
+        logging.warning("Failed to fetch MEXC OHLCV: %s", e)
+        return []
 
-        if isinstance(data, list):
-            filtered = [d for d in data if d.get("symbol") == symbol]
-            if filtered:
-                data = filtered[0]
-            else:
-                data = data[0] if data else {}
+def fetch_mexc_ticker(symbol=SYMBOL):
+    global _LAST_MEXC_TICKER_SUCCESS
+    try:
+        url = f"{MEXC_BASE}/ticker"
+        r = requests.get(url, params={"symbol": symbol}, timeout=5, headers={"User-Agent": "LiquidBot/1.0"})
+        r.raise_for_status()
+        resp = r.json()
+        if not resp.get("success"):
+            logging.warning("MEXC ticker not success: %s", resp)
+            return {}
+        _LAST_MEXC_TICKER_SUCCESS = time.time()
+        return resp.get("data", {})
+    except Exception as e:
+        logging.warning("Failed to fetch MEXC ticker: %s", e)
+        return {}
 
-        volume24 = float(data.get("volume24", 0))
-        open_interest = float(data.get("holdVol", 0))
-        funding_rate = float(data.get("fundingRate", 0))
+# --- Liquidation inference ---
+def infer_liquidation_pressure_from_mexc_enhanced():
+    global _LAST_MEXC_OI, _LAST_LIQ_SOURCE
+    try:
+        ticker = fetch_mexc_ticker()
+        if not ticker:
+            return 0.0, "mexc_failed"
+        open_interest = float(ticker.get("holdVol", 0))
+        funding_rate = float(ticker.get("fundingRate", 0))
 
         oi_change = 0.0
         if _LAST_MEXC_OI and _LAST_MEXC_OI > 0:
@@ -280,324 +286,425 @@ def infer_liquidation_pressure_from_mexc():
         oi_factor = 1 + max(0.0, oi_change)
         funding_factor = 1 + min(abs(funding_rate), 0.005) * 50
 
-        composite_pressure = volume24 * oi_factor * funding_factor
+        composite_pressure = (open_interest / 1e9) * oi_factor * funding_factor * 1_000_000
 
-        source = (
-            f"mexc_enhanced(vol={int(volume24):,}, oi={int(open_interest):,}, "
-            f"Δoi={oi_change:.2%}, fund_rate={funding_rate:.4f})"
-        )
-
+        source = f"mexc_enhanced(oi={int(open_interest):,}, Δoi={oi_change:.2%}, fund_rate={funding_rate:.4f})"
+        _LAST_LIQ_SOURCE = source
         return composite_pressure, source
     except Exception as e:
-        logger.warning("Enhanced MEXC pressure failed: %s", e)
-        try:
-            resp = requests.get("https://contract.mexc.com/api/v1/contract/ticker", timeout=5)
-            j = resp.json()
-            data = j.get("data", {})
-            if isinstance(data, list):
-                data = data[0] if data else {}
-            volume24 = float(data.get("volume24", 0))
-            return volume24, "mexc_fallback_volume"
-        except Exception:
-            return 0.0, "fallback"
+        logging.warning("Enhanced MEXC pressure failed: %s", e)
+        return infer_liquidation_pressure_from_mexc_simple()
 
+def infer_liquidation_pressure_from_mexc_simple():
+    global _LAST_LIQ_SOURCE
+    try:
+        ticker = fetch_mexc_ticker()
+        if not ticker:
+            return 0.0, "mexc_failed"
+        open_interest = float(ticker.get("holdVol", 0))
+        funding_rate = float(ticker.get("fundingRate", 0))
+        if open_interest <= 0:
+            return 0.0, "mexc_no_oi"
+        pressure = (open_interest / 1e9) * (1 + abs(funding_rate) * 10)
+        fallback_liq = pressure * 1_000_000
+        source = "mexc_inferred"
+        _LAST_LIQ_SOURCE = source
+        return fallback_liq, source
+    except Exception as e:
+        logging.warning("Infer simple MEXC pressure failed: %s", e)
+        return 0.0, "fallback"
 
-# Scoring
-def score_long(rsi, lower_wick_pct, liquidation):
-    s = 0.0
+def fetch_coinglass_liquidation():
+    global _LAST_COINGLASS_SUCCESS, _LAST_LIQ_SOURCE
+    if not COINGLASS_API_KEY:
+        return 0, "coinglass_missing"
+    try:
+        headers = {"accept": "application/json", "coinglassSecret": COINGLASS_API_KEY}
+        url = "https://open-api.coinglass.com/public/v2/liquidation/chart?symbol=BTC"
+        resp = requests.get(url, headers=headers, timeout=10)
+        if resp.status_code != 200:
+            logger.warning("CoinGlass HTTP %s: %s", resp.status_code, resp.text[:200])
+            return 0, "coinglass_error"
+        data = resp.json()
+        total = 0
+        if isinstance(data.get("data"), list):
+            for entry in data["data"]:
+                total += entry.get("sumAmount", entry.get("liquidationAmount", 0))
+        _LAST_COINGLASS_SUCCESS = time.time()
+        _LAST_LIQ_SOURCE = "coinglass"
+        return total, "coinglass"
+    except Exception as e:
+        logging.warning("CoinGlass fetch failed: %s", e)
+        return 0, "coinglass_failed"
+
+def fetch_combined_liquidation():
+    cg, src = fetch_coinglass_liquidation()
+    if cg and cg > 0:
+        return cg, src
+    enhanced, src_enh = infer_liquidation_pressure_from_mexc_enhanced()
+    if enhanced and enhanced > 0:
+        return enhanced, src_enh
+    simple, src_simple = infer_liquidation_pressure_from_mexc_simple()
+    if simple and simple > 0:
+        return simple, src_simple
+    return 0, "none"
+
+# --- Price fallback ---
+def fetch_coingecko_price_candle():
+    try:
+        resp = requests.get(
+            "https://api.coingecko.com/api/v3/simple/price",
+            params={"ids": "bitcoin", "vs_currencies": "usd"},
+            timeout=6,
+            headers={"User-Agent": "LiquidBot/1.0"},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        price = float(data.get("bitcoin", {}).get("usd", 0))
+        if price > 0:
+            t_ms = int(time.time() * 1000)
+            return [{"open_time": t_ms, "open": price, "high": price, "low": price, "close": price}]
+    except Exception as e:
+        logging.warning("CoinGecko fallback failed: %s", e)
+    return []
+
+# --- Indicators / scoring ---
+def compute_rsi(closes, period=14):
+    if len(closes) < period + 1:
+        return None
+    gains = []
+    losses = []
+    for i in range(1, period + 1):
+        delta = closes[i] - closes[i - 1]
+        gains.append(max(delta, 0))
+        losses.append(max(-delta, 0))
+    avg_gain = sum(gains) / period
+    avg_loss = sum(losses) / period
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    rsi = 100 - (100 / (1 + rs))
+    return round(rsi, 2)
+
+def calculate_score(rsi, wick_pct, liquidation_usd, funding_rate=1.0):
+    score = 0
     if rsi is not None:
-        s += max(0, (50 - rsi) / 50)
-    s += min(lower_wick_pct / 100, 1.0)
-    s += min(liquidation / 1_000_000, 1.0)
-    return round(s, 2)
+        if rsi < 35:
+            score += (35 - rsi) * 0.05
+        elif rsi > 65:
+            score += (rsi - 65) * 0.03
+    score += min(wick_pct, 5) * 0.2
+    score += min(liquidation_usd / 5_000_000, 2) * 0.5
+    score *= funding_rate
+    return round(score, 2)
 
+def compute_adaptive_tp_sl(entry_price, ohlcv):
+    # baseline points from env
+    base_tp = int(os.getenv("TP_POINTS", "600"))
+    base_sl = int(os.getenv("SL_POINTS", "200"))
+    # volatility-based scaling (last 12 candles)
+    if ohlcv and len(ohlcv) >= 1:
+        ranges = [c["high"] - c["low"] for c in ohlcv[-12:]] if len(ohlcv) >= 12 else [c["high"] - c["low"] for c in ohlcv]
+        avg_range = sum(ranges) / len(ranges) if ranges else 0
+        tp_points = max(base_tp, int(avg_range * 4))
+        sl_points = max(base_sl, int(avg_range * 1.5))
+    else:
+        tp_points = base_tp
+        sl_points = base_sl
+    return tp_points, sl_points
 
-def score_short(rsi, upper_wick_pct, liquidation):
-    s = 0.0
-    if rsi is not None:
-        s += max(0, (rsi - 50) / 50)
-    s += min(upper_wick_pct / 100, 1.0)
-    s += min(liquidation / 1_000_000, 1.0)
-    return round(s, 2)
+def check_tp_sl_points(entry_price, current_price, direction, tp_points, sl_points):
+    if direction == "long":
+        if current_price >= entry_price + tp_points:
+            return "TP HIT"
+        if current_price <= entry_price - sl_points:
+            return "SL HIT"
+    else:
+        if current_price <= entry_price - tp_points:
+            return "TP HIT"
+        if current_price >= entry_price + sl_points:
+            return "SL HIT"
+    return "open"
 
+# --- Signal generation with learning gating ---
+def generate_trade_signal():
+    ohlcv = fetch_mexc_ohlcv()
+    if not ohlcv:
+        ohlcv = fetch_coingecko_price_candle()
+    if not ohlcv:
+        return None
+    closes = [c["close"] for c in ohlcv]
+    rsi = compute_rsi(closes[-15:]) if len(closes) >= 15 else None
+    last = ohlcv[-1]
+    open_p = last["open"]
+    close_p = last["close"]
+    high = last["high"]
+    low = last["low"]
+    total_range = high - low if high - low != 0 else 1
+    lower_wick_pct = ((min(open_p, close_p) - low) / total_range) * 100
+    upper_wick_pct = ((high - max(open_p, close_p)) / total_range) * 100
 
-# Model training & prediction
-def train_model_incremental():
-    conn = get_conn()
+    liquidation, source = fetch_combined_liquidation()
+    funding_rate = 1.0  # placeholder
+
+    direction = None
+    wick_pct = 0
+    if rsi is None:
+        return None
+    if rsi < 35 and lower_wick_pct > 0.5:
+        direction = "long"
+        wick_pct = lower_wick_pct
+    elif rsi > 65 and upper_wick_pct > 0.5:
+        direction = "short"
+        wick_pct = upper_wick_pct
+    else:
+        return None
+
+    score = calculate_score(rsi, wick_pct, liquidation, funding_rate)
+
+    # Empirical win probability from score bucket
+    bucket = bucket_for_score(score)
+    win_prob = get_bucket_win_rate(bucket)
+
+    # Session label
+    now_utc = UTC.localize(datetime.utcnow())
+    session = session_for_time(now_utc)
+
+    # Adaptive TP/SL in points
+    tp_points, sl_points = compute_adaptive_tp_sl(close_p, ohlcv)
+
+    # Build signal
+    entry_price = close_p
+    signal = {
+        "time": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+        "direction": direction,
+        "entry_price": entry_price,
+        "rsi": rsi,
+        "wick_percent": round(wick_pct, 2),
+        "liquidation_usd": liquidation,
+        "score": score,
+        "result": "open",
+        "tp_points": tp_points,
+        "sl_points": sl_points,
+        "liquidation_source": source,
+        "win_prob": round(win_prob, 3),
+        "session": session,
+    }
+
+    return signal
+
+# --- Persistence / evaluation ---
+def store_trade(trade):
+    conn = _get_conn()
     c = conn.cursor()
     c.execute(
-        "SELECT direction, rsi, wick_percent, liquidation_usd, result FROM trades WHERE result IS NOT NULL AND result != 'open'"
+        """INSERT INTO trades 
+           (time, direction, entry_price, result, exit_price, exit_time,
+            rsi, wick_percent, liquidation_usd, score, tp_points, sl_points, liquidation_source, win_prob, session)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            trade.get("time"),
+            trade.get("direction"),
+            trade.get("entry_price"),
+            trade.get("result", "open"),
+            trade.get("exit_price"),
+            trade.get("exit_time"),
+            trade.get("rsi"),
+            trade.get("wick_percent"),
+            trade.get("liquidation_usd"),
+            trade.get("score"),
+            trade.get("tp_points"),
+            trade.get("sl_points"),
+            trade.get("liquidation_source"),
+            trade.get("win_prob"),
+            trade.get("session"),
+        ),
     )
+    conn.commit()
+    conn.close()
+
+def evaluate_open_trades():
+    conn = _get_conn()
+    c = conn.cursor()
+    c.execute("SELECT * FROM trades WHERE result = 'open'")
+    rows = c.fetchall()
+    if not rows:
+        conn.close()
+        return
+    ohlcv = fetch_mexc_ohlcv()
+    if not ohlcv:
+        ohlcv = fetch_coingecko_price_candle()
+    if not ohlcv:
+        conn.close()
+        return
+    current_price = ohlcv[-1]["close"]
+    updated = False
+    for r in rows:
+        trade_id = r[0]
+        direction = r[2]
+        entry_price = r[3]
+        tp_points = r[10]
+        sl_points = r[11]
+        status = check_tp_sl_points(entry_price, current_price, direction, tp_points, sl_points)
+        if status in ("TP HIT", "SL HIT"):
+            exit_time = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+            c.execute(
+                "UPDATE trades SET result = ?, exit_price = ?, exit_time = ? WHERE id = ?",
+                (status, current_price, exit_time, trade_id),
+            )
+            # record performance immediately
+            updated_trade = {
+                "score": r[10] if False else r[9],  # score field at index 9
+                "result": status,
+                "session": r[15] if len(r) > 15 else "other",
+            }
+            updated = True
+    if updated:
+        conn.commit()
+        # refresh performance stats from closed trades (incremental)
+        update_performance_from_closed_trades(days=180)
+    conn.close()
+
+# --- Reporting ---
+def format_trade_row(r):
+    (
+        _,
+        time_str,
+        direction,
+        entry_price,
+        result,
+        exit_price,
+        exit_time,
+        rsi,
+        wick,
+        liq,
+        score,
+        tp_points,
+        sl_points,
+        source,
+        win_prob,
+        session,
+    ) = r
+    # show time in IST
+    try:
+        dt = datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S")
+        dt = UTC.localize(dt).astimezone(IST)
+        time_fmt = dt.strftime("%Y-%m-%d %H:%M:%S IST")
+    except:
+        time_fmt = time_str
+    s = (
+        f"{time_fmt} | {direction.upper()} @ {entry_price:.1f} | "
+        f"RSI={rsi} | Wick={wick:.2f}% | Liq=${liq:,} ({source}) | "
+        f"Score={score} | WinProb={win_prob:.0%} | TP+{tp_points} | SL-{sl_points} | Session={session}"
+    )
+    if result and result != "open":
+        s += f" | {result} @ {exit_price:.1f} ({exit_time})"
+    return s
+
+def get_last_trades(limit=30):
+    conn = _get_conn()
+    c = conn.cursor()
+    c.execute("SELECT * FROM trades ORDER BY id DESC LIMIT ?", (limit,))
     rows = c.fetchall()
     conn.close()
     if not rows:
-        return "No closed trades to train on."
+        return "No recent trades."
+    return "\n".join(format_trade_row(r) for r in rows)
 
-    X = []
-    y = []
-    for direction, rsi, wick, liq, result in rows:
-        features = [rsi or 50, wick or 0, liq or 0, 1 if direction == "long" else 0]
-        X.append(features)
-        label = 1 if "TP" in (result or "").upper() else 0
-        y.append(label)
-    X = np.array(X)
-    y = np.array(y)
+def get_logs(limit=20):
+    return get_last_trades(limit)
 
-    scaler = StandardScaler()
-    Xs = scaler.fit_transform(X)
-
-    # Defensive loss name handling
-    try:
-        clf = SGDClassifier(loss="log_loss", max_iter=1000, tol=1e-3)
-        clf.fit(Xs, y)
-    except Exception:
-        clf = SGDClassifier(loss="log", max_iter=1000, tol=1e-3)
-        clf.fit(Xs, y)
-
-    joblib.dump({"scaler": scaler, "clf": clf}, MODEL_PATH)
-    return f"Trained on {len(y)} samples."
-
-
-def predict_win_prob(signal):
-    if not os.path.exists(MODEL_PATH):
-        return 0.5
-    try:
-        obj = joblib.load(MODEL_PATH)
-        scaler = obj["scaler"]
-        clf = obj["clf"]
-        direction = signal.get("direction")
-        rsi = signal.get("rsi") or 50
-        wick = signal.get("wick_percent") or 0
-        liq = signal.get("liquidation_usd") or 0
-        features = np.array([[rsi, wick, liq, 1 if direction == "long" else 0]])
-        Xs = scaler.transform(features)
-        proba = clf.predict_proba(Xs)[0][1]
-        return round(float(proba), 2)
-    except Exception:
-        return 0.5
-
-
-# Empirical strength
-def fetch_closed_trades():
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute(
-        "SELECT direction, rsi, wick_percent, liquidation_usd, result FROM trades WHERE result IS NOT NULL AND result != 'open'"
+def get_status():
+    default = {"rsi_threshold": 35, "wick_threshold": 0.5, "liq_threshold": 2_000_000, "min_win_rate": 0.5}
+    if os.path.exists(STRATEGY_FILE):
+        try:
+            with open(STRATEGY_FILE, "r") as f:
+                default = json.load(f)
+        except:
+            pass
+    return (
+        f"Thresholds: RSI<{default.get('rsi_threshold')} / >{100 - default.get('rsi_threshold')}, "
+        f"Wick>{default.get('wick_threshold')}%, Liq>${default.get('liq_threshold'):,}, "
+        f"MinWinRate={default.get('min_win_rate'):.2f}"
     )
+
+def run_backtest(days=7):
+    cutoff = datetime.utcnow() - timedelta(days=days)
+    conn = _get_conn()
+    c = conn.cursor()
+    c.execute("SELECT * FROM trades ORDER BY id DESC")
     rows = c.fetchall()
     conn.close()
-    trades = []
-    for direction, rsi, wick, liq, result in rows:
-        label = 1 if "TP" in (result or "").upper() else 0
-        trades.append(
-            {
-                "direction": direction,
-                "rsi": rsi or 50,
-                "wick_percent": wick or 0,
-                "liquidation_usd": liq or 0,
-                "label": label,
-            }
-        )
-    return trades
+    filtered = []
+    for r in rows:
+        try:
+            t = datetime.strptime(r[1], "%Y-%m-%d %H:%M:%S")
+        except:
+            continue
+        if t >= cutoff:
+            filtered.append(format_trade_row(r))
+    if not filtered:
+        return f"No trades in last {days} days."
+    return "📉 Backtest:\n" + "\n".join(filtered[:30])
 
-
-def get_setup_strength(signal, k=50):
-    base_features = np.array(
-        [
-            signal.get("rsi") or 50,
-            signal.get("wick_percent") or 0,
-            signal.get("liquidation_usd") or 0,
-            1 if signal.get("direction") == "long" else 0,
-        ],
-        dtype=float,
+def get_results_summary():
+    conn = _get_conn()
+    c = conn.cursor()
+    c.execute("SELECT result, score FROM trades WHERE result IN ('TP HIT','SL HIT')")
+    closed = c.fetchall()
+    conn.close()
+    if not closed:
+        return "No closed trades yet."
+    wins = sum(1 for r in closed if r[0] == "TP HIT")
+    losses = sum(1 for r in closed if r[0] == "SL HIT")
+    total = wins + losses
+    win_rate = round((wins / total) * 100, 2) if total else 0
+    conn = _get_conn()
+    c = conn.cursor()
+    c.execute("SELECT score FROM trades")
+    all_scores = [r[0] for r in c.fetchall()]
+    conn.close()
+    avg_score = round(sum(all_scores) / len(all_scores), 2) if all_scores else 0
+    return (
+        f"Closed trades: {total}\n"
+        f"Wins (TP): {wins}\n"
+        f"Losses (SL): {losses}\n"
+        f"Win rate: {win_rate}%\n"
+        f"Avg score: {avg_score}"
     )
 
-    trades = fetch_closed_trades()
-    if not trades:
-        return {"empirical_win_rate": None, "count": 0}
-
-    X = []
-    labels = []
-    for t in trades:
-        f = np.array(
-            [t["rsi"], t["wick_percent"], t["liquidation_usd"], 1 if t["direction"] == "long" else 0], dtype=float
-        )
-        X.append(f)
-        labels.append(t["label"])
-    X = np.array(X)
-    labels = np.array(labels)
-
-    X_norm = np.column_stack([X[:, 0] / 100.0, X[:, 1] / 100.0, X[:, 2] / 1_000_000.0, X[:, 3]])
-    base_norm = np.array([base_features[0] / 100.0, base_features[1] / 100.0, base_features[2] / 1_000_000.0, base_features[3]])
-
-    dists = np.linalg.norm(X_norm - base_norm, axis=1)
-    idx = np.argsort(dists)[:k]
-    nearest_labels = labels[idx]
-    count = len(nearest_labels)
-    wins = int(nearest_labels.sum())
-
-    alpha = 1
-    beta_param = 1
-    empirical_rate = (wins + alpha) / (count + alpha + beta_param)
+# --- News ---
+def fetch_news():
+    if not NEWS_API_KEY:
+        return ["No news API key set."]
     try:
-        ci_lower, ci_upper = beta.ppf([0.05, 0.95], wins + alpha, count - wins + beta_param)
-    except Exception:
-        ci_lower, ci_upper = 0, 1
+        url = f"https://cryptopanic.com/api/v1/posts/?auth_token={NEWS_API_KEY}&currencies=BTC"
+        r = requests.get(url, timeout=10)
+        if r.status_code != 200:
+            return [f"CryptoPanic HTTP {r.status_code}: {r.text[:200]}"]
+        data = r.json()
+        items = data.get("results", [])[:5]
+        if not items:
+            return ["No recent news found."]
+        headlines = []
+        for it in items:
+            title = it.get("title", "No title")
+            link = it.get("url", "")
+            headlines.append(f"• {title}\n{link}")
+        return headlines
+    except Exception as e:
+        return [f"News fetch error: {e}"]
+
+# --- Live status ---
+def get_live_data_status():
+    def fmt(ts):
+        if not ts:
+            return "never"
+        return datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S UTC")
 
     return {
-        "empirical_win_rate": round(empirical_rate, 2),
-        "count": count,
-        "ci_lower": round(ci_lower, 2),
-        "ci_upper": round(ci_upper, 2),
+        "mexc_ohlcv_last_success": fmt(_LAST_MEXC_OHLCV_SUCCESS),
+        "mexc_ticker_last_success": fmt(_LAST_MEXC_TICKER_SUCCESS),
+        "coinglass_last_success": fmt(_LAST_COINGLASS_SUCCESS),
+        "last_liq_source": _LAST_LIQ_SOURCE,
     }
-
-
-# Historical simulation
-def simulate_history(candles):
-    results = []
-    for i in range(15, len(candles) - 10):
-        window = candles[i - 15 : i + 1]
-        closes = [c["close"] for c in window]
-        rsi = compute_rsi(closes) or 50
-        last = candles[i]
-        open_p = last["open"]
-        close_p = last["close"]
-        high = last["high"]
-        low = last["low"]
-        total_range = high - low if high - low != 0 else 1
-        lower_wick_pct = (min(open_p, close_p) - low) / total_range * 100
-        upper_wick_pct = (high - max(open_p, close_p)) / total_range * 100
-
-        liquidation, source = infer_liquidation_pressure_from_mexc()
-        long_score = score_long(rsi, lower_wick_pct, liquidation)
-        short_score = score_short(rsi, upper_wick_pct, liquidation)
-
-        direction = "long" if long_score >= short_score else "short"
-        entry_price = close_p
-        tp_price = entry_price + TP_POINTS if direction == "long" else entry_price - TP_POINTS
-        sl_price = entry_price - SL_POINTS if direction == "long" else entry_price + SL_POINTS
-
-        result_label = "NO SIGNAL"
-        exit_price = None
-        for future in candles[i + 1 : i + 21]:
-            if direction == "long":
-                if future["high"] >= tp_price:
-                    result_label = "TP HIT"
-                    exit_price = tp_price
-                    break
-                if future["low"] <= sl_price:
-                    result_label = "SL HIT"
-                    exit_price = sl_price
-                    break
-            else:
-                if future["low"] <= tp_price:
-                    result_label = "TP HIT"
-                    exit_price = tp_price
-                    break
-                if future["high"] >= sl_price:
-                    result_label = "SL HIT"
-                    exit_price = sl_price
-                    break
-        if result_label == "NO SIGNAL":
-            continue
-
-        trade = {
-            "time": datetime.utcfromtimestamp(last["ts"] / 1000).strftime("%Y-%m-%d %H:%M:%S"),
-            "direction": direction,
-            "entry_price": entry_price,
-            "exit_price": round(exit_price, 2),
-            "exit_time": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
-            "result": result_label,
-            "rsi": rsi,
-            "wick_percent": round(lower_wick_pct if direction == "long" else upper_wick_pct, 2),
-            "liquidation_usd": liquidation,
-            "score": long_score if direction == "long" else short_score,
-            "win_prob": 1.0,
-            "tp_pct": (TP_POINTS / entry_price) * 100,
-            "sl_pct": (SL_POINTS / entry_price) * 100,
-            "reward_to_risk": TP_POINTS / SL_POINTS,
-            "volume_z": 1.0,
-            "liq_ratio": 1.0,
-            "liquidation_source": source,
-        }
-        trade["label"] = 1 if result_label == "TP HIT" else 0
-        results.append(trade)
-    return results
-
-
-# Full-year backfill + simulation with progress
-def backfill_one_year_with_progress(progress_callback=None):
-    now = int(time.time())
-    one_year_ago = now - 365 * 24 * 3600
-    chunk_seconds = 300 * 300  # ~25h chunks
-    total_chunks = ((now - one_year_ago) + chunk_seconds - 1) // chunk_seconds
-    all_candles = []
-    cursor = one_year_ago
-    chunk_index = 0
-    while cursor < now:
-        end = min(cursor + chunk_seconds, now)
-        chunk = fetch_mexc_ohlcv_range(start=cursor, end=end) if False else []  # placeholder; fallback to load_cached_history below
-        # fallback to simpler historic retrieval if above is disabled
-        if not chunk:
-            # reuse fetch_mexc_ohlcv to get last known
-            chunk = fetch_mexc_ohlcv(limit=500)
-        if chunk:
-            all_candles.extend(chunk)
-        cursor = end
-        chunk_index += 1
-        if progress_callback:
-            pct = int(chunk_index / total_chunks * 100)
-            progress_callback(f"🟦 Backfill progress: {pct}% ({chunk_index}/{total_chunks} chunks)")
-        time.sleep(0.1)
-    unique = {c["ts"]: c for c in all_candles if "ts" in c}
-    sorted_candles = sorted(unique.values(), key=lambda x: x["ts"])
-    joblib.dump(sorted_candles, HIST_CACHE)
-    if progress_callback:
-        progress_callback(f"✅ Backfill complete, cached {len(sorted_candles)} candles.")
-    return sorted_candles
-
-
-def simulate_and_store_full_history_with_progress(progress_callback=None):
-    if progress_callback:
-        progress_callback("🔁 Starting full-year backfill + simulation...")
-    candles = load_cached_history()
-    if not candles:
-        candles = backfill_one_year_with_progress(progress_callback=progress_callback)
-    if not candles:
-        return "Failed to load historical candles."
-    if progress_callback:
-        progress_callback("🧠 Simulating signals over history...")
-    results = simulate_history(candles)
-    if not results:
-        return "No signals simulated during full-year backfill."
-    wins = sum(1 for r in results if r.get("label") == 1)
-    total = len(results)
-    if progress_callback:
-        progress_callback(f"📊 Simulation complete: {wins}/{total} wins. Storing trades...")
-    for i, r in enumerate(results, start=1):
-        store_trade(r)
-        if progress_callback and i % max(1, total // 10) == 0:
-            pct = int(i / total * 100)
-            progress_callback(f"💾 Storing trades: {pct}% ({i}/{total})")
-    if progress_callback:
-        progress_callback("📈 Training model on stored history...")
-    train_msg = train_model_incremental()
-    if progress_callback:
-        progress_callback(f"✅ Training complete: {train_msg}")
-    return f"Full-year simulation stored {total} trades, wins: {wins}/{total} ({wins/total:.1%}). {train_msg}"
-
-
-def load_cached_history():
-    if os.path.exists(HIST_CACHE):
-        try:
-            return joblib.load(HIST_CACHE)
-        except Exception:
-            pass
-    now = int(time.time())
-    one_year_ago = now - 365 * 24 * 3600
-    # simplistic fill: just fetch current and treat as history if nothing else
-    bucket = fetch_mexc_ohlcv(limit=500)
-    if bucket:
-        joblib.dump(bucket, HIST_CACHE)
-        return bucket
-    return []

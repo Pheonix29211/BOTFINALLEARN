@@ -1,407 +1,333 @@
 import os
 import logging
-import threading
+import time
+from threading import Thread
 from datetime import datetime
 from flask import Flask, request
 from telegram import Bot, Update
 from telegram.ext import Dispatcher, CommandHandler
-from telegram.utils.request import Request
 from dotenv import load_dotenv
-from apscheduler.schedulers.background import BackgroundScheduler
 import pytz
 
-from new_utils import (
-    fetch_mexc_ohlcv,
-    compute_rsi,
-    compute_atr,
-    infer_liquidation_pressure_from_mexc,
-    score_long,
-    score_short,
-    train_model_incremental,
-    predict_win_prob,
-    load_cached_history,
-    simulate_history,
-    store_trade,
-    get_last_trades,
-    simulate_and_store_full_history_with_progress,
-    get_setup_strength,
-    get_live_data_status,
-)
-
-# Load environment
+# Load env
 load_dotenv()
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+
+# Environment
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 OWNER_CHAT_ID = os.getenv("OWNER_CHAT_ID")
-ASSET = os.getenv("TRADING_ASSET", "BTC").upper()
-PAIR_DISPLAY = f"{ASSET}/USDT"
+MIN_WIN_RATE = float(os.getenv("MIN_WIN_RATE", "0.5"))
 
-TP_POINTS = int(os.getenv("TP_POINTS", "600"))
-SL_POINTS = int(os.getenv("SL_POINTS", "200"))
-WIN_PROB_THRESHOLD = float(os.getenv("WIN_PROB_THRESHOLD", "0.6"))
+if not TELEGRAM_TOKEN or not WEBHOOK_URL:
+    raise RuntimeError("Missing TELEGRAM_BOT_TOKEN or WEBHOOK_URL in environment.")
 
-# Timezone setup
-IST = pytz.timezone("Asia/Kolkata")
-
-
-def format_time_ist(dt=None):
-    if dt is None:
-        dt = datetime.utcnow()
-    return dt.replace(tzinfo=pytz.UTC).astimezone(IST).strftime("%Y-%m-%d %H:%M:%S %Z")
-
+# Setup
+bot = Bot(token=TELEGRAM_TOKEN)
+app = Flask(__name__)
+dispatcher = Dispatcher(bot, None, workers=4, use_context=True)
+os.environ["TZ"] = "Asia/Kolkata"  # for any legacy uses
 
 # Logging
-logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
-logger = logging.getLogger("learner_bot")
+logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
+logger = logging.getLogger("LiquidBot")
 
-# Validate env
-if not TOKEN:
-    raise SystemExit("Missing TELEGRAM_BOT_TOKEN in environment.")
-if not WEBHOOK_URL:
-    raise SystemExit("Missing WEBHOOK_URL in environment.")
-if not OWNER_CHAT_ID:
-    raise SystemExit("Missing OWNER_CHAT_ID in environment.")
+# Timezones
+UTC = pytz.UTC
+IST = pytz.timezone("Asia/Kolkata")
 
-# Telegram bot with higher connection pool to avoid pool-full warnings
-request_obj = Request(con_pool_size=20, connect_timeout=5, read_timeout=10)
-bot = Bot(token=TOKEN, request=request_obj)
+# Utils imports
+from utils import (
+    generate_trade_signal,
+    store_trade,
+    evaluate_open_trades,
+    get_last_trades,
+    get_results_summary,
+    run_backtest,
+    get_status,
+    get_logs,
+    fetch_combined_liquidation,
+    fetch_news,
+    get_live_data_status,
+    fetch_mexc_ohlcv,
+    fetch_mexc_ticker,
+    format_trade_row,
+    format_performance,
+    update_performance_from_closed_trades,
+)
 
-app = Flask(__name__)
-dispatcher = Dispatcher(bot, None, use_context=True)
-
-# Dedup / cooldown
-last_sent = {"long": (None, 0), "short": (None, 0)}
-COOLDOWN_SECONDS = 10 * 60  # 10 minutes
-PRICE_TOLERANCE = 0.01  # 1%
-
-# train_full guard
-train_full_in_progress = False
-train_full_lock = threading.Lock()
-
-# Safe fetch fallback for live OHLCV
+# --- Safe OHLCV fetch with backoff ---
 _last_good_ohlcv = None
 _live_failures = 0
-LIVE_FAILURE_ALERT_THRESHOLD = 3
+_backoff_seconds = 60  # initial backoff
+_last_attempt_time = 0
+MAX_BACKOFF = 8 * 60  # 8 minutes
+ALERT_THRESHOLD = 4  # after this many consecutive failures, notify
 
 def safe_fetch_ohlcv():
-    global _last_good_ohlcv, _live_failures
-    data = fetch_mexc_ohlcv()
-    if data:
+    global _last_good_ohlcv, _live_failures, _backoff_seconds, _last_attempt_time
+    now = time.time()
+    if _live_failures > 0 and (now - _last_attempt_time) < _backoff_seconds:
+        return _last_good_ohlcv or []
+    _last_attempt_time = now
+    ohlcv = fetch_mexc_ohlcv()
+    if not ohlcv:
+        # fallback to coingecko inside utils if implemented
+        try:
+            from utils import fetch_coingecko_price_candle
+            ohlcv = fetch_coingecko_price_candle()
+        except ImportError:
+            ohlcv = []
+    if ohlcv:
         _live_failures = 0
-        _last_good_ohlcv = data
-        return data
+        _backoff_seconds = 60
+        _last_good_ohlcv = ohlcv
+        return ohlcv
     _live_failures += 1
-    if _live_failures >= LIVE_FAILURE_ALERT_THRESHOLD:
+    _backoff_seconds = min(MAX_BACKOFF, _backoff_seconds * 2)
+    if _live_failures >= ALERT_THRESHOLD:
         try:
             bot.send_message(
                 chat_id=OWNER_CHAT_ID,
-                text=f"⚠️ Live OHLCV fetch failing {_live_failures} times in a row for {ASSET}. Using last good snapshot if available.",
+                text=(
+                    f"⚠️ Live OHLCV fetch failing {_live_failures} times; "
+                    f"using last snapshot if available. Backoff {_backoff_seconds//60}m."
+                ),
             )
         except Exception:
             pass
-    if _last_good_ohlcv:
-        return _last_good_ohlcv
-    return []
+    return _last_good_ohlcv or []
 
-def evaluate_signal():
-    try:
-        ohlcv = safe_fetch_ohlcv()
-        if not ohlcv:
-            logger.warning("No OHLCV data.")
-            return None
-        closes = [c.get("close") for c in ohlcv]
-        rsi = compute_rsi(closes[-15:]) if len(closes) >= 15 else None
-        atr = compute_atr(ohlcv[-15:]) if len(ohlcv) >= 15 else None
-        last = ohlcv[-1]
-        open_p = last.get("open")
-        close_p = last.get("close")
-        high = last.get("high")
-        low = last.get("low")
-        total_range = high - low if high - low != 0 else 1
-        lower_wick_pct = (min(open_p, close_p) - low) / total_range * 100
-        upper_wick_pct = (high - max(open_p, close_p)) / total_range * 100
+# --- Command handlers ---
 
-        liquidation, source = infer_liquidation_pressure_from_mexc()
-        long_score = score_long(rsi, lower_wick_pct, liquidation)
-        short_score = score_short(rsi, upper_wick_pct, liquidation)
+def start(update: Update, context):
+    update.message.reply_text("🚀 LiquidBot live. Use /menu to see commands.")
 
-        if short_score > long_score:
-            direction = "short"
-            wick_pct = upper_wick_pct
-            base_score = short_score
-        else:
-            direction = "long"
-            wick_pct = lower_wick_pct
-            base_score = long_score
-
-        entry_price = close_p
-        if direction == "long":
-            tp_price = entry_price + TP_POINTS
-            sl_price = entry_price - SL_POINTS
-        else:
-            tp_price = entry_price - TP_POINTS
-            sl_price = entry_price + SL_POINTS
-
-        tp_pct = abs(tp_price / entry_price - 1) * 100
-        sl_pct = abs(sl_price / entry_price - 1) * 100
-        reward_to_risk = TP_POINTS / SL_POINTS
-
-        signal = {
-            "time": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
-            "direction": direction,
-            "entry_price": entry_price,
-            "rsi": rsi,
-            "wick_percent": round(wick_pct, 2),
-            "liquidation_usd": liquidation,
-            "score": base_score,
-            "tp_pct": round(tp_pct, 2),
-            "sl_pct": round(sl_pct, 2),
-            "tp_price": round(tp_price, 2),
-            "sl_price": round(sl_price, 2),
-            "reward_to_risk": round(reward_to_risk, 2),
-            "volume_z": None,
-            "liq_ratio": None,
-            "liquidation_source": source,
-        }
-
-        win_prob = predict_win_prob(signal)
-        signal["win_prob"] = round(win_prob, 2)
-
-        strength = get_setup_strength(signal, k=50)
-        empirical = strength.get("empirical_win_rate")
-        count = strength.get("count")
-        ci_lo = strength.get("ci_lower") or 0
-        ci_hi = strength.get("ci_upper") or 0
-
-        composite_strength = signal["win_prob"]
-        if empirical is not None:
-            weight_empirical = min(0.7, count / (count + 30))
-            weight_model = 1 - weight_empirical
-            composite_strength = round(weight_model * signal["win_prob"] + weight_empirical * empirical, 2)
-
-        if composite_strength < WIN_PROB_THRESHOLD:
-            return None
-
-        prev_price, prev_ts = last_sent[direction]
-        now_ts = datetime.utcnow().timestamp()
-        price_change = abs(entry_price - (prev_price or entry_price)) / (prev_price or entry_price)
-        if prev_price is not None and (now_ts - prev_ts) < COOLDOWN_SECONDS and price_change < PRICE_TOLERANCE:
-            return None
-
-        last_sent[direction] = (entry_price, now_ts)
-
-        signal["result"] = "open"
-        store_trade(signal)
-
-        emp_display = f"{empirical:.2%}" if empirical is not None else "N/A"
-        ci_display = f"{ci_lo:.2%}-{ci_hi:.2%}" if empirical is not None else "N/A"
-
-        msg = (
-            f"🚨 {direction.upper()} Signal for {ASSET} ({format_time_ist()})\n"
-            f"Pair: {PAIR_DISPLAY}\n"
-            f"Entry: {entry_price:.1f}\n"
-            f"RSI: {rsi} | Wick%: {signal['wick_percent']}% | Liq proxy: ${liquidation:,.0f} ({source})\n"
-            f"Base Score: {base_score} | WinProb: {signal['win_prob']} | Empirical: {emp_display} ({count} similar, CI {ci_display})\n"
-            f"Composite Strength: {composite_strength} | RR: {signal['reward_to_risk']}\n"
-            f"TP: +{signal['tp_pct']}% @ {signal['tp_price']:.1f} | SL: -{signal['sl_pct']}% @ {signal['sl_price']:.1f}"
-        )
-        return msg
-    except Exception as e:
-        logger.exception("evaluate_signal error: %s", e)
-        return None
-
-
-# Command handlers
-def start(update, context):
+def menu(update: Update, context):
     update.message.reply_text(
-        f"Welcome to LearnerBot Ultimate (BTC edition)!\nAvailable commands:\n"
-        "/menu - list\n"
-        "/scan - current signal\n"
-        "/train - incremental retrain\n"
-        "/train_full - full-year backfill + learning\n"
-        "/backtest - last 7 days simulation\n"
-        "/last30 - show last 30 stored trades\n"
-        "/status - live data/status"
+        "/menu\n"
+        "/start\n"
+        "/backtest\n"
+        "/last30\n"
+        "/results\n"
+        "/status\n"
+        "/logs\n"
+        "/liqcheck\n"
+        "/news\n"
+        "/scan\n"
+        "/envcheck\n"
+        "/debug_sources\n"
+        "/learn\n"
+        "/performance"
     )
 
+def backtest_cmd(update: Update, context):
+    update.message.reply_text(run_backtest())
 
-def menu(update, context):
-    start(update, context)
+def last30_cmd(update: Update, context):
+    update.message.reply_text(get_last_trades())
 
+def results_cmd(update: Update, context):
+    update.message.reply_text(get_results_summary())
 
-def scan(update, context):
-    msg = evaluate_signal()
-    if msg:
-        bot.send_message(chat_id=OWNER_CHAT_ID, text=msg)
-        update.message.reply_text("✅ Signal sent.")
+def status_cmd(update: Update, context):
+    strategy = get_status()
+    live = get_live_data_status()
+    extra = (
+        f"\n\n📡 Live Data Status:\n"
+        f" • MEXC OHLCV last success: {live.get('mexc_ohlcv_last_success')}\n"
+        f" • MEXC ticker last success: {live.get('mexc_ticker_last_success')}\n"
+        f" • CoinGlass last success: {live.get('coinglass_last_success')}\n"
+        f" • Last liquidation source: {live.get('last_liq_source')}"
+    )
+    update.message.reply_text(strategy + extra)
+
+def logs_cmd(update: Update, context):
+    update.message.reply_text(get_logs())
+
+def liqcheck(update: Update, context):
+    liq, source = fetch_combined_liquidation()
+    update.message.reply_text(f"Liquidation proxy: ${liq:,.0f} (source: {source})")
+
+def news_cmd(update: Update, context):
+    headlines = fetch_news()
+    if isinstance(headlines, list):
+        update.message.reply_text("\n\n".join(headlines))
     else:
-        update.message.reply_text("No strong/new signal right now.")
+        update.message.reply_text(str(headlines))
 
+def envcheck(update: Update, context):
+    required = ["TELEGRAM_BOT_TOKEN", "WEBHOOK_URL", "OWNER_CHAT_ID"]
+    missing = [name for name in required if not os.getenv(name)]
+    if missing:
+        update.message.reply_text("Missing env vars: " + ", ".join(missing))
+    else:
+        update.message.reply_text("All primary env vars present.")
 
-def train(update, context):
-    res = train_model_incremental()
-    update.message.reply_text(res)
-
-
-def train_full(update, context):
-    global train_full_in_progress
-    chat_id = update.effective_chat.id
-
-    with train_full_lock:
-        if train_full_in_progress:
-            update.message.reply_text("⚠️ Full-year training already running. Please wait.")
-            return
-        train_full_in_progress = True
-
-    update.message.reply_text("🚀 Starting full-year simulation and training; this can take a while...")
-
-    def worker():
-        global train_full_in_progress
-        try:
-            def progress_callback(msg_text):
-                try:
-                    bot.send_message(chat_id=chat_id, text=f"[{format_time_ist()}] {msg_text}")
-                except Exception:
-                    pass
-
-            result = simulate_and_store_full_history_with_progress(progress_callback=progress_callback)
-            bot.send_message(chat_id=chat_id, text=f"✅ Done: {result}")
-        except Exception as e:
-            bot.send_message(chat_id=chat_id, text=f"❌ Error during full-year train: {e}")
-            logger.exception("train_full worker error: %s", e)
-        finally:
-            with train_full_lock:
-                train_full_in_progress = False
-
-    threading.Thread(target=worker, daemon=True).start()
-
-
-def backtest(update, context):
-    update.message.reply_text("🔁 Running 7-day backtest and storing trades...")
-    candles = load_cached_history()
-    now_ms = int(datetime.utcnow().timestamp() * 1000)
-    seven_days_ms = 7 * 24 * 3600 * 1000
-    recent = [c for c in candles if c.get("ts", 0) >= now_ms - seven_days_ms]
-    if not recent:
-        update.message.reply_text("No historical data for backtest.")
-        return
-    results = simulate_history(recent)
-    total = len(results)
-    if total == 0:
-        update.message.reply_text("No signals simulated in last 7 days.")
-        return
-    wins = sum(1 for r in results if r.get("label") == 1)
-    for i, r in enumerate(results, start=1):
-        entry = r.get("entry_price")
-        direction = r.get("direction")
-        if r.get("result") == "TP HIT":
-            if direction == "long":
-                exit_price = entry + TP_POINTS
-            else:
-                exit_price = entry - TP_POINTS
-        else:
-            if direction == "long":
-                exit_price = entry - SL_POINTS
-            else:
-                exit_price = entry + SL_POINTS
-        r["exit_price"] = round(exit_price, 2)
-        r["exit_time"] = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-        r["tp_pct"] = (TP_POINTS / entry) * 100
-        r["sl_pct"] = (SL_POINTS / entry) * 100
-        r["win_prob"] = 1.0
-        r["reward_to_risk"] = TP_POINTS / SL_POINTS
-        r["volume_z"] = 1.0
-        r["liq_ratio"] = 1.0
-        r["news_sentiment"] = 0.0
-        store_trade(r)
-        if i % max(1, total // 5) == 0:
-            pct = int(i / total * 100)
-            update.message.reply_text(f"💾 Backtest storing progress: {pct}% ({i}/{total})")
-    summary = f"Backtest last 7d: {wins}/{total} wins ({wins/total:.1%}) stored {total} trades."
-    update.message.reply_text(summary)
-
-
-def last30(update, context):
-    res = get_last_trades(30)
-    update.message.reply_text(res)
-
-
-def status(update, context):
-    st = get_live_data_status()
-    text = (
-        f"🛰️ Live data status for {ASSET}:\n"
-        f"MEXC last success: {st['mexc_last_success']} [{'OK' if st['mexc_ok'] else 'STALE'}]\n"
-        f"Binance last success: {st['binance_last_success']} [{'OK' if st['binance_ok'] else 'STALE'}]\n"
-        f"Last used source: {st['last_used']}"
+def debug_sources(update: Update, context):
+    ohlcv = safe_fetch_ohlcv()
+    last_close = ohlcv[-1]["close"] if ohlcv else "n/a"
+    liq, source = fetch_combined_liquidation()
+    mexc_ticker = fetch_mexc_ticker()
+    hold_vol = mexc_ticker.get("holdVol", "n/a")
+    funding = mexc_ticker.get("fundingRate", "n/a")
+    update.message.reply_text(
+        f"MEXC last close: {last_close}\n"
+        f"Liquidation proxy: ${liq:,.0f} (source: {source})\n"
+        f"MEXC holdVol: {hold_vol}\n"
+        f"MEXC fundingRate: {funding}"
     )
-    update.message.reply_text(text)
 
+def learn_cmd(update: Update, context):
+    perf = update_performance_from_closed_trades(days=180)
+    update.message.reply_text("Rebuilt performance stats from last 6 months.\n" + format_performance())
+
+def performance_cmd(update: Update, context):
+    update.message.reply_text(format_performance())
+
+def send_signal_message(signal):
+    direction = signal["direction"].upper()
+    score = signal["score"]
+    entry = signal["entry_price"]
+    rsi = signal["rsi"]
+    wick = signal["wick_percent"]
+    liq = signal["liquidation_usd"]
+    source = signal.get("liquidation_source", "unknown")
+    tp = signal.get("tp_points")
+    sl = signal.get("sl_points")
+    win_prob = signal.get("win_prob", 0)
+    session = signal.get("session", "unknown")
+
+    strength = "Strong" if score >= 1.5 else ("Moderate" if score >= 1.0 else "Weak")
+    confidence_tag = f"{win_prob:.0%} historical win rate"
+    if win_prob >= 0.6:
+        leverage_hint = "Higher leverage"
+    elif win_prob >= 0.4:
+        leverage_hint = "Cautious / low leverage"
+    else:
+        leverage_hint = "Skip / very low confidence"
+
+    msg = (
+        f"🚨 {direction} Signal ({strength})\n"
+        f"Entry: {entry:.1f}\n"
+        f"RSI: {rsi} | Wick%: {wick:.2f}% | Liq: ${liq:,.0f} ({source})\n"
+        f"Score: {score} | {confidence_tag} | Session: {session}\n"
+        f"TP: +{tp} pts | SL: -{sl} pts\n"
+        f"Leverage hint: {leverage_hint}"
+    )
+    try:
+        if OWNER_CHAT_ID:
+            bot.send_message(chat_id=OWNER_CHAT_ID, text=msg)
+        else:
+            logger.warning("OWNER_CHAT_ID not set; cannot send signal.")
+    except Exception as e:
+        logger.error("Failed to send signal message: %s", e)
+
+def scan_cmd(update: Update, context):
+    try:
+        evaluate_open_trades()
+    except Exception as e:
+        update.message.reply_text(f"Error evaluating open trades: {e}")
+
+    ohlcv = safe_fetch_ohlcv()
+    if not ohlcv:
+        update.message.reply_text("🔍 Scan: failed to fetch price data.")
+        return
+
+    # Show debug info similar to previous versions
+    closes = [c["close"] for c in ohlcv]
+    # compute RSI via utils
+    from utils import compute_rsi, calculate_score
+    rsi = compute_rsi(closes[-15:]) if len(closes) >= 15 else None
+    last = ohlcv[-1]
+    open_p = last["open"]
+    close_p = last["close"]
+    high = last["high"]
+    low = last["low"]
+    total_range = high - low if high - low != 0 else 1
+    lower_wick_pct = ((min(open_p, close_p) - low) / total_range) * 100
+    upper_wick_pct = ((high - max(open_p, close_p)) / total_range) * 100
+    liq, source = fetch_combined_liquidation()
+    score_long = calculate_score(rsi, lower_wick_pct, liq) if rsi is not None else None
+    score_short = calculate_score(rsi, upper_wick_pct, liq) if rsi is not None else None
+
+    debug_msg = (
+        f"🛠️ Debug Info:\n"
+        f"RSI: {rsi}\n"
+        f"Lower wick %: {lower_wick_pct:.2f}\n"
+        f"Upper wick %: {upper_wick_pct:.2f}\n"
+        f"Liquidation proxy: ${liq:,.0f} (source: {source})\n"
+        f"Score Long: {score_long} | Score Short: {score_short}"
+    )
+    update.message.reply_text(debug_msg)
+
+    signal = generate_trade_signal()
+    if signal:
+        # gating based on empirical win rate
+        win_prob = signal.get("win_prob", 0)
+        if win_prob < MIN_WIN_RATE:
+            update.message.reply_text(f"Signal suppressed due to low historical win rate ({win_prob:.0%} < {MIN_WIN_RATE:.0%})")
+        else:
+            try:
+                store_trade(signal)
+            except Exception as e:
+                update.message.reply_text(f"Failed to store signal: {e}")
+            send_signal_message(signal)
+            update.message.reply_text("🔍 Scan: real signal processed.")
+    else:
+        update.message.reply_text("🔍 Scan: no high-confidence real signal.")
 
 # Register handlers
 dispatcher.add_handler(CommandHandler("start", start))
 dispatcher.add_handler(CommandHandler("menu", menu))
-dispatcher.add_handler(CommandHandler("scan", scan))
-dispatcher.add_handler(CommandHandler("train", train))
-dispatcher.add_handler(CommandHandler("train_full", train_full))
-dispatcher.add_handler(CommandHandler("backtest", backtest))
-dispatcher.add_handler(CommandHandler("last30", last30))
-dispatcher.add_handler(CommandHandler("status", status))
+dispatcher.add_handler(CommandHandler("backtest", backtest_cmd))
+dispatcher.add_handler(CommandHandler("last30", last30_cmd))
+dispatcher.add_handler(CommandHandler("results", results_cmd))
+dispatcher.add_handler(CommandHandler("status", status_cmd))
+dispatcher.add_handler(CommandHandler("logs", logs_cmd))
+dispatcher.add_handler(CommandHandler("liqcheck", liqcheck))
+dispatcher.add_handler(CommandHandler("news", news_cmd))
+dispatcher.add_handler(CommandHandler("scan", scan_cmd))
+dispatcher.add_handler(CommandHandler("envcheck", envcheck))
+dispatcher.add_handler(CommandHandler("debug_sources", debug_sources))
+dispatcher.add_handler(CommandHandler("learn", learn_cmd))
+dispatcher.add_handler(CommandHandler("performance", performance_cmd))
 
-# Auto-scan scheduler in IST
-def auto_job():
-    try:
-        msg = evaluate_signal()
-        if msg:
-            bot.send_message(chat_id=OWNER_CHAT_ID, text="(Auto) " + msg)
-    except Exception as e:
-        logger.warning("Auto job error: %s", e)
-
-
-scheduler = BackgroundScheduler(timezone=IST)
-scheduler.add_job(auto_job, "interval", minutes=5, next_run_time=datetime.now(IST))
-
-# Health alert for MEXC staleness
-_mexc_alerted = False
-
-
-def health_check_job():
-    global _mexc_alerted
-    st = get_live_data_status()
-    if not st["mexc_ok"]:
-        if not _mexc_alerted:
-            bot.send_message(
-                chat_id=OWNER_CHAT_ID,
-                text=f"⚠️ MEXC live data stale. Last successful fetch: {st['mexc_last_success']}",
-            )
-            _mexc_alerted = True
-    else:
-        if _mexc_alerted:
-            bot.send_message(
-                chat_id=OWNER_CHAT_ID,
-                text="✅ MEXC live data recovered.",
-            )
-            _mexc_alerted = False
-
-
-scheduler.add_job(health_check_job, "interval", minutes=1)
-scheduler.start()
-
-
-# Webhook
-@app.route(f"/{TOKEN}", methods=["POST"])
+# Webhook route
+@app.route(f"/{TELEGRAM_TOKEN}", methods=["POST"])
 def webhook():
     update = Update.de_json(request.get_json(force=True), bot)
     dispatcher.process_update(update)
     return "ok"
 
-
 @app.route("/")
 def index():
-    return "LearnerBot Ultimate running."
+    return "Bot is running."
+
+# Scheduled background job
+def scheduled_tasks():
+    try:
+        evaluate_open_trades()
+        signal = generate_trade_signal()
+        if signal:
+            win_prob = signal.get("win_prob", 0)
+            if win_prob >= MIN_WIN_RATE:
+                store_trade(signal)
+                send_signal_message(signal)
+            else:
+                logger.info(f"Skipped signal due to low win_prob {win_prob:.2f}")
+    except Exception as e:
+        logger.error("Scheduled task error: %s", e)
+
+def start_scheduler():
+    while True:
+        scheduled_tasks()
+        time.sleep(300)  # 5 minutes
 
 if __name__ == "__main__":
-    logging.info(
-        "Starting LearnerBot Ultimate with webhook %s", f"{WEBHOOK_URL}/{TOKEN}"
-    )
-    bot.set_webhook(url=f"{WEBHOOK_URL}/{TOKEN}")
+    logging.info("Starting bot with webhook URL: %s", f"{WEBHOOK_URL}/{TELEGRAM_TOKEN}")
+    try:
+        bot.set_webhook(url=f"{WEBHOOK_URL}/{TELEGRAM_TOKEN}")
+    except Exception as e:
+        logger.warning("Failed to set webhook: %s", e)
+    Thread(target=start_scheduler, daemon=True).start()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
