@@ -7,6 +7,7 @@ from telegram import Bot, Update
 from telegram.ext import Dispatcher, CommandHandler
 from dotenv import load_dotenv
 from apscheduler.schedulers.background import BackgroundScheduler
+import pytz
 
 from new_utils import (
     fetch_mexc_ohlcv,
@@ -25,7 +26,7 @@ from new_utils import (
     get_setup_strength,
 )
 
-# Load env
+# Load environment
 load_dotenv()
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
@@ -35,11 +36,20 @@ TP_POINTS = int(os.getenv("TP_POINTS", "600"))
 SL_POINTS = int(os.getenv("SL_POINTS", "200"))
 WIN_PROB_THRESHOLD = float(os.getenv("WIN_PROB_THRESHOLD", "0.6"))
 
+# Timezone setup
+IST = pytz.timezone("Asia/Kolkata")
+
+def format_time_ist(dt=None):
+    if dt is None:
+        dt = datetime.utcnow()
+    # Assume dt is naive UTC
+    return dt.replace(tzinfo=pytz.UTC).astimezone(IST).strftime("%Y-%m-%d %H:%M:%S %Z")
+
 # Logging
 logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
 logger = logging.getLogger("learner_bot")
 
-# Validate required vars
+# Validate required env vars
 if not TOKEN:
     raise SystemExit("Missing TELEGRAM_BOT_TOKEN in environment.")
 if not WEBHOOK_URL:
@@ -51,7 +61,7 @@ bot = Bot(token=TOKEN)
 app = Flask(__name__)
 dispatcher = Dispatcher(bot, None, use_context=True)
 
-# Dedup memory
+# Dedup / cooldown memory
 last_sent = {"long": (None, 0), "short": (None, 0)}
 COOLDOWN_SECONDS = 10 * 60  # 10 minutes
 PRICE_TOLERANCE = 0.01  # 1%
@@ -65,7 +75,7 @@ def evaluate_signal():
     try:
         ohlcv = fetch_mexc_ohlcv()
         if not ohlcv:
-            logger.warning("No OHLCV.")
+            logger.warning("No OHLCV data.")
             return None
         closes = [c.get("close") for c in ohlcv]
         rsi = compute_rsi(closes[-15:]) if len(closes) >= 15 else None
@@ -125,7 +135,6 @@ def evaluate_signal():
         win_prob = predict_win_prob(signal)
         signal["win_prob"] = round(win_prob, 2)
 
-        # Empirical strength
         strength = get_setup_strength(signal, k=50)
         empirical = strength.get("empirical_win_rate")
         count = strength.get("count")
@@ -141,7 +150,6 @@ def evaluate_signal():
         if composite_strength < WIN_PROB_THRESHOLD:
             return None
 
-        # dedupe
         prev_price, prev_ts = last_sent[direction]
         now_ts = datetime.utcnow().timestamp()
         price_change = abs(entry_price - (prev_price or entry_price)) / (prev_price or entry_price)
@@ -157,7 +165,7 @@ def evaluate_signal():
         ci_display = f"{ci_lo:.2%}-{ci_hi:.2%}" if empirical is not None else "N/A"
 
         msg = (
-            f"🚨 {direction.upper()} Signal\n"
+            f"🚨 {direction.upper()} Signal ({format_time_ist()})\n"
             f"Entry: {entry_price:.1f}\n"
             f"RSI: {rsi} | Wick%: {signal['wick_percent']}% | Liq: ${liquidation:,.0f} ({source})\n"
             f"Base Score: {base_score} | WinProb: {signal['win_prob']} | Empirical: {emp_display} ({count} similar, CI {ci_display})\n"
@@ -170,13 +178,14 @@ def evaluate_signal():
         return None
 
 
+# Telegram command handlers
 def start(update, context):
     update.message.reply_text(
         "Welcome to LearnerBot Ultimate!\nAvailable commands:\n"
         "/menu - list\n"
         "/scan - current signal\n"
         "/train - incremental retrain\n"
-        "/train_full - full-year backfill + learning (heavy)\n"
+        "/train_full - full-year backfill + learning\n"
         "/backtest - last 7 days simulation\n"
         "/last30 - show last 30 stored trades"
     )
@@ -217,7 +226,7 @@ def train_full(update, context):
         try:
             def progress_callback(msg_text):
                 try:
-                    bot.send_message(chat_id=chat_id, text=msg_text)
+                    bot.send_message(chat_id=chat_id, text=f"[{format_time_ist()}] {msg_text}")
                 except Exception:
                     pass
 
@@ -234,7 +243,7 @@ def train_full(update, context):
 
 
 def backtest(update, context):
-    start_msg = update.message.reply_text("🔁 Running 7-day backtest and storing trades...")
+    update.message.reply_text("🔁 Running 7-day backtest and storing trades...")
     candles = load_cached_history()
     now_ms = int(datetime.utcnow().timestamp() * 1000)
     seven_days_ms = 7 * 24 * 3600 * 1000
@@ -262,7 +271,7 @@ def backtest(update, context):
             else:
                 exit_price = entry + SL_POINTS
         r["exit_price"] = round(exit_price, 2)
-        r["exit_time"] = r.get("time")
+        r["exit_time"] = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
         r["tp_pct"] = (TP_POINTS / entry) * 100
         r["sl_pct"] = (SL_POINTS / entry) * 100
         r["win_prob"] = 1.0
@@ -271,7 +280,6 @@ def backtest(update, context):
         r["liq_ratio"] = 1.0
         r["news_sentiment"] = 0.0
         store_trade(r)
-        # progress every ~20%
         if i % max(1, total // 5) == 0:
             pct = int(i / total * 100)
             update.message.reply_text(f"💾 Backtest storing progress: {pct}% ({i}/{total})")
@@ -284,7 +292,7 @@ def last30(update, context):
     update.message.reply_text(res)
 
 
-# Handlers
+# Register handlers
 dispatcher.add_handler(CommandHandler("start", start))
 dispatcher.add_handler(CommandHandler("menu", menu))
 dispatcher.add_handler(CommandHandler("scan", scan))
@@ -293,7 +301,8 @@ dispatcher.add_handler(CommandHandler("train_full", train_full))
 dispatcher.add_handler(CommandHandler("backtest", backtest))
 dispatcher.add_handler(CommandHandler("last30", last30))
 
-# Auto-scan scheduler
+
+# Auto-scan scheduler with Indian timezone
 def auto_job():
     try:
         msg = evaluate_signal()
@@ -302,16 +311,19 @@ def auto_job():
     except Exception as e:
         logger.warning("Auto job error: %s", e)
 
-scheduler = BackgroundScheduler()
-scheduler.add_job(auto_job, "interval", minutes=5, next_run_time=datetime.utcnow())
+
+scheduler = BackgroundScheduler(timezone=IST)
+scheduler.add_job(auto_job, "interval", minutes=5, next_run_time=datetime.now(IST))
 scheduler.start()
 
-# Webhook
+
+# Webhook endpoints
 @app.route(f"/{TOKEN}", methods=["POST"])
 def webhook():
     update = Update.de_json(request.get_json(force=True), bot)
     dispatcher.process_update(update)
     return "ok"
+
 
 @app.route("/")
 def index():
